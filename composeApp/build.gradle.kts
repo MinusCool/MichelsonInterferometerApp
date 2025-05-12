@@ -36,6 +36,8 @@ kotlin {
         androidMain.dependencies {
             implementation(compose.preview)
             implementation(libs.androidx.activity.compose)
+            implementation("org.eclipse.paho:org.eclipse.paho.android.service:1.1.1")
+            implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
         }
         commonMain.dependencies {
             implementation(compose.runtime)
@@ -50,6 +52,7 @@ kotlin {
         desktopMain.dependencies {
             implementation(compose.desktop.currentOs)
             implementation(libs.kotlinx.coroutines.swing)
+            implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
         }
     }
 }
