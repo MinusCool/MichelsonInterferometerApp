@@ -1,10 +1,15 @@
 package org.example.project
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.*
 
@@ -20,90 +25,123 @@ fun App() {
         val coroutineScope = rememberCoroutineScope()
 
         Column(
-            modifier = Modifier.fillMaxSize().padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.Start
         ) {
-            Text("Status: $status")
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Button(onClick = {
+            // Status Section
+            Spacer(Modifier.weight(1f))
+            Text("Status", style = MaterialTheme.typography.h6)
+            Spacer(Modifier.height(8.dp))
+            StatusIndicator(status) { newStatus ->
                 coroutineScope.launch {
-                    if (status == "Disconnected") {
+                    if (newStatus == "Connected") {
                         MQTTClient.connect()
-                        status = "Connected"
                     } else {
                         MQTTClient.disconnect()
-                        status = "Disconnected"
+                        angleOrDistance = ""
+                        speed = ""
+                        repetitions = ""
                     }
+                    status = newStatus
                 }
-            }) {
-                Text(if (status == "Disconnected") "Connect" else "Disconnect")
+
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(Modifier.height(24.dp))
 
-            // Select Box Mode
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Mode: ")
-                Spacer(modifier = Modifier.width(8.dp))
-                DropdownMenuButton(mode, listOf("Linear", "Rotasi")) { selected ->
-                    mode = selected
-                }
+            // Mode Section
+            Text("Mode", style = MaterialTheme.typography.h6)
+            Spacer(Modifier.height(8.dp))
+            DropdownMenuButton(mode, listOf("Linear", "Rotasi")) { selected ->
+                mode = selected
+                angleOrDistance = ""
+                speed = ""
+                repetitions = ""
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(Modifier.height(24.dp))
+            // Settings Section
+            Text("Settings", style = MaterialTheme.typography.h6)
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                TextField(
+                    value = angleOrDistance,
+                    onValueChange = { angleOrDistance = it },
+                    label = { Text(if (mode == "Linear") "Distance" else "Angle") },
+                    modifier = Modifier.weight(1f)
+                )
+                TextField(
+                    value = speed,
+                    onValueChange = { speed = it },
+                    label = { Text("Speed") },
+                    modifier = Modifier.weight(1f)
+                )
+            }
 
-            // Input for Angle or Distance
-            TextField(
-                value = angleOrDistance,
-                onValueChange = { angleOrDistance = it },
-                label = { Text(if (mode == "Linear") "Distance" else "Angle") }
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Input for Speed
-            TextField(
-                value = speed,
-                onValueChange = { speed = it },
-                label = { Text("Speed") }
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Input for Repetitions
+            Spacer(Modifier.height(8.dp))
             TextField(
                 value = repetitions,
                 onValueChange = { repetitions = it },
-                label = { Text("Repetitions") }
+                label = { Text("Repetitions") },
+                modifier = Modifier.fillMaxWidth()
             )
 
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Start Button (Kirim semua data sekaligus)
-            Button(onClick = {
-                coroutineScope.launch {
-                    val dataMessage = buildString {
-                        append("Mode:$mode;")
-                        append("${if (mode == "Linear") "Distance" else "Angle"}:$angleOrDistance;")
-                        append("Speed:$speed;")
-                        append("Repetitions:$repetitions;")
-                        append("START")
+            // Push Start Button to bottom
+            //Spacer(Modifier.weight(1f))
+            Spacer(Modifier.height(24.dp))
+            // Start Button at the bottom
+            Button(
+                onClick = {
+                    coroutineScope.launch {
+                        val dataMessage = buildString {
+                            append("Mode:$mode;")
+                            append("${if (mode == "Linear") "Distance" else "Angle"}:$angleOrDistance;")
+                            append("Speed:$speed;")
+                            append("Repetitions:$repetitions;")
+                            append("START")
+                        }
+                        MQTTClient.publish(dataMessage)
                     }
-                    MQTTClient.publish(dataMessage)
-                }
-            }) { Text("Start") }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("START")
+            }
         }
     }
 }
 
 @Composable
+fun StatusIndicator(status: String, onToggle: (String) -> Unit) {
+    val isConnected = status == "Connected"
+    val color = if (isConnected) Color.Green else Color.Red
+    val displayText = if (isConnected) "Connected" else "Disconnected"
+
+    Button(
+        onClick = {
+            val newStatus = if (isConnected) "Disconnected" else "Connected"
+            onToggle(newStatus)
+        },
+        colors = ButtonDefaults.buttonColors(backgroundColor = color),
+        modifier = Modifier.fillMaxWidth()  // Membuat tombol selebar layar
+    ) {
+        Text(displayText, color = Color.White)
+    }
+}
+
+
+@Composable
 fun DropdownMenuButton(currentSelection: String, options: List<String>, onSelectionChange: (String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
 
-    Box {
-        Button(onClick = { expanded = true }) {
+    Box(modifier = Modifier.fillMaxWidth(0.5f)) {  // Box selebar setengah layar
+        Button(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth()) {  // Button isi penuh Box
             Text(currentSelection)
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
