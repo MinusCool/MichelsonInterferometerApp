@@ -13,6 +13,8 @@ actual object MQTTClient {
     private val persistence = MemoryPersistence()
     private var mqttClient: MqttClient? = null
 
+    actual var onMessageReceived: (String) -> Unit = {}
+
     actual fun connect() {
         try {
             mqttClient = MqttClient(broker, clientId, persistence)
@@ -21,9 +23,28 @@ actual object MQTTClient {
                 userName = username
                 password = this@MQTTClient.password.toCharArray()
             }
+
+            mqttClient?.setCallback(object : MqttCallback {
+                override fun connectionLost(cause: Throwable?) {
+                    println("Connection lost: ${cause?.message}")
+                }
+
+                override fun messageArrived(topic: String?, message: MqttMessage?) {
+                    val received = message?.toString() ?: ""
+                    println("Message received: $received")
+                    onMessageReceived(received)  // Kirim ke UI
+                }
+
+                override fun deliveryComplete(token: IMqttDeliveryToken?) {
+                    // Tidak perlu diproses untuk sekadar menerima pesan
+                }
+            })
+
             println("Connecting to broker: $broker")
             mqttClient?.connect(connOpts)
-            println("Connected")
+            mqttClient?.subscribe(topic)  // Subscribe ke topik saat connect
+            println("Connected and subscribed to $topic")
+
         } catch (e: MqttException) {
             println("Error Connecting: ${e.message}")
         }
