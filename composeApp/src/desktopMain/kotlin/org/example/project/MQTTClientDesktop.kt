@@ -46,4 +46,8 @@ actual object MQTTClient {
             println("Error Publishing: ${e.message}")
         }
     }
+
+    actual var onMessageReceived: (String) -> Unit
+        get() = TODO("Not yet implemented")
+        set(value) {}
 }

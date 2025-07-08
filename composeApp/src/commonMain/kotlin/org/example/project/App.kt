@@ -5,31 +5,61 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Done
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.*
+
+import androidx.compose.runtime.Composable
+//import androidx.compose.ui.res.painterResource
+import androidx.compose.material3.Icon
+import androidx.compose.ui.draw.clip
+import interferometerapp.composeapp.generated.resources.Res
+import interferometerapp.composeapp.generated.resources.interferometer_header
+import org.jetbrains.compose.resources.painterResource
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.ui.layout.ContentScale
+
+//import org.jetbrains.compose.resources.painterResource
 
 @Composable
 fun App() {
     MaterialTheme(
-        colorScheme = lightColorScheme()
+        colorScheme = lightColorScheme(
+            primary = Color(0xFF3E64FF),
+            onPrimary = Color.White,
+            secondary = Color(0xFF03A9F4),
+            onSecondary = Color.White,
+            background = Color(0xFFF3F6FD),
+            onBackground = Color.Black,
+            surface = Color.White,
+            onSurface = Color.Black,
+            primaryContainer = Color(0xFF3E64FF),
+            onPrimaryContainer = Color.White
+        )
     ) {
         val scrollState = rememberScrollState()
         val coroutineScope = rememberCoroutineScope()
@@ -45,7 +75,6 @@ fun App() {
         var repetitions by remember { mutableStateOf("") }
         var status by remember { mutableStateOf("Disconnected") }
 
-        // Fokus state untuk animasi border
         var isFocused1 by remember { mutableStateOf(false) }
         var isFocused2 by remember { mutableStateOf(false) }
         var isFocused3 by remember { mutableStateOf(false) }
@@ -58,7 +87,6 @@ fun App() {
         LaunchedEffect(Unit) {
             MQTTClient.onMessageReceived = { message ->
                 val isControlMessage = message.contains("Mode:") && message.contains("START")
-
                 if (!isControlMessage) {
                     message.lines().forEach { line ->
                         val parts = line.split(":")
@@ -67,7 +95,6 @@ fun App() {
                         if (channel != null && value != null) {
                             sensorMessages.add(line)
                             if (sensorMessages.size > 200) sensorMessages.removeFirst()
-
                             val list = channelMap.getOrPut(channel) { mutableListOf() }
                             list.add(value)
                             if (list.size > 100) list.removeFirst()
@@ -77,42 +104,53 @@ fun App() {
             }
         }
 
-        Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+        ) {
+            HeaderWithMicroscope()
+
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(16.dp)
-                    .verticalScroll(scrollState),
+                    .padding(top = 230.dp)
+                    .clip(RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp))
+                    .background(MaterialTheme.colorScheme.surface)
+                    .padding(horizontal = 16.dp)
+                    .verticalScroll(scrollState)
+                    .navigationBarsPadding()
+                    .imePadding(), // *** ADD THIS LINE ***
                 horizontalAlignment = Alignment.Start
             ) {
-                val sensorLogText = sensorMessages.joinToString("\n")
+                Spacer(Modifier.height(16.dp))
+
                 OutlinedTextField(
-                    value = sensorLogText,
+                    value = sensorMessages.joinToString("\n"),
                     onValueChange = { },
                     label = { Text("MQTT Messages") },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(150.dp)
+                        .heightIn(min = 100.dp, max = 200.dp)
                         .verticalScroll(rememberScrollState()),
                     readOnly = true
                 )
 
                 Spacer(Modifier.height(16.dp))
 
-                ElevatedButton(
+                Button(
                     onClick = { showNavigationPopup = true },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF03A9F4),
-                        contentColor = Color.White
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary
                     )
                 ) {
-                    Text("Buka Pop-up Navigasi")
+                    Text("Generate Data Visualization")
                 }
 
                 Spacer(Modifier.height(24.dp))
 
-                Spacer(Modifier.weight(1f))
                 Text("Status", style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.height(8.dp))
                 StatusIndicator(status) { newStatus ->
@@ -207,7 +245,7 @@ fun App() {
                 )
 
                 Spacer(Modifier.height(24.dp))
-                ElevatedButton(
+                Button(
                     onClick = {
                         coroutineScope.launch {
                             val dataMessage = buildString {
@@ -222,15 +260,15 @@ fun App() {
                     },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0x88fcba03),
-                        contentColor = Color.White
+                        containerColor = MaterialTheme.colorScheme.secondary,
+                        contentColor = MaterialTheme.colorScheme.onSecondary
                     )
                 ) {
                     Text("START")
                 }
+                Spacer(Modifier.height(16.dp))
             }
 
-            // Animated pop-up overlay
             AnimatedVisibility(
                 visible = showNavigationPopup,
                 enter = fadeIn(),
@@ -248,7 +286,6 @@ fun NavigationOverlayPage(
     channelMap: Map<Int, List<Int>>,
     onBack: () -> Unit
 ) {
-    // Warna default per channel
     val channelColors = listOf(
         Color.Blue, Color.Red, Color.Green, Color.Magenta,
         Color.Cyan, Color.Yellow, Color.Gray, Color.Black,
@@ -260,24 +297,25 @@ fun NavigationOverlayPage(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.White),
+            .background(Color.White)
+            .statusBarsPadding() // Add statusBarsPadding to move content below status bar
     ) {
+        // Scrollable content
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(24.dp)
+                .padding(horizontal = 24.dp) // Apply horizontal padding
+                .padding(top = 16.dp) // Add some top padding below status bar
                 .verticalScroll(scrollState),
             horizontalAlignment = Alignment.Start
         ) {
-            Text("Halaman Navigasi", style = MaterialTheme.typography.titleLarge)
+            Text("Data Visualization", style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.height(8.dp))
 
-            // Untuk setiap channel (repetitions), buat 1 chart
             channelMap.forEach { (channel, values) ->
                 if (values.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // Judul dan legend
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
                             modifier = Modifier
@@ -290,7 +328,6 @@ fun NavigationOverlayPage(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    // Canvas line chart
                     Canvas(modifier = Modifier
                         .fillMaxWidth()
                         .height(200.dp)) {
@@ -343,13 +380,32 @@ fun NavigationOverlayPage(
                     }
                 }
             }
+            // Add a generous spacer at the end of the scrollable content
+            // to ensure there's enough space above the fixed button.
+            // This needs to be at least the height of the button + its padding.
+            Spacer(modifier = Modifier.height(100.dp)) // Increased spacer
+        }
 
-            Spacer(modifier = Modifier.height(24.dp))
-
+        // Fixed "Back" button at the bottom
+        // This Column will layer on top of the scrollable content
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.BottomCenter) // Keeps the button at the bottom
+                .background(Color.White) // Ensures no content bleeds through
+                .navigationBarsPadding() // IMPORTANT: Adjusts for system navigation bar
+                .padding(horizontal = 24.dp, vertical = 16.dp) // Padding around the button
+        ) {
             Button(
                 onClick = onBack,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary
+                )
             ) {
+                Icon(Icons.Default.Home, contentDescription = "")
+                Spacer(modifier = Modifier.width(8.dp))
                 Text("Back")
             }
         }
@@ -362,20 +418,20 @@ fun NavigationOverlayPage(
 fun StatusIndicator(status: String, onToggle: (String) -> Unit) {
     val isConnected = status == "Connected"
     val displayText = if (isConnected) "Connected" else "Disconnected"
-    val baseColor = if (isConnected) Color.Green else Color.Red
-    val semiTransparentColor = baseColor.copy(alpha = 0.5f)
+    val containerColor = if (isConnected) MaterialTheme.colorScheme.primary else Color(0xFFFF5252)
 
     Button(
         onClick = {
             val newStatus = if (isConnected) "Disconnected" else "Connected"
             onToggle(newStatus)
         },
-        colors = ButtonDefaults.buttonColors(containerColor = semiTransparentColor),
+        colors = ButtonDefaults.buttonColors(containerColor = containerColor),
         modifier = Modifier.fillMaxWidth()
     ) {
         Text(displayText, color = Color.White)
     }
 }
+
 
 // Selection Chip Linear / Rotation
 @Composable
@@ -389,13 +445,23 @@ fun ModeSelectionChipGroup(
             FilterChip(
                 selected = isSelected,
                 onClick = { onModeChange(mode) },
-                label = { Text(mode) },
+                label = {
+                    Text(
+                        mode,
+                        color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+                    )
+                },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = MaterialTheme.colorScheme.primary,
+                    containerColor = MaterialTheme.colorScheme.surface
+                ),
                 leadingIcon = if (isSelected) {
                     {
                         Icon(
                             imageVector = Icons.Filled.Done,
                             contentDescription = "Selected",
-                            modifier = Modifier.size(FilterChipDefaults.IconSize)
+                            modifier = Modifier.size(FilterChipDefaults.IconSize),
+                            tint = MaterialTheme.colorScheme.onPrimary
                         )
                     }
                 } else null,
@@ -403,6 +469,28 @@ fun ModeSelectionChipGroup(
                     .weight(1f)
                     .fillMaxWidth()
             )
+
         }
+    }
+}
+
+
+@Composable
+fun HeaderWithMicroscope() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(280.dp)
+            .clip(RoundedCornerShape(bottomStart = 32.dp, bottomEnd = 32.dp))
+            //.background(Color.Transparent) // transparan karena gambar sudah punya background
+            .statusBarsPadding()
+    ) {
+        Image(
+            painter = painterResource(Res.drawable.interferometer_header),
+            contentDescription = "Header Illustration",
+            modifier = Modifier.fillMaxSize(), // Gambar akan mengisi seluruh Box header
+            contentScale = ContentScale.Crop
+            //contentScale = ContentScale.FillBounds // Penting: Agar gambar mengisi Box sepenuhnya
+        )
     }
 }
