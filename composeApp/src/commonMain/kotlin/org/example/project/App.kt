@@ -248,6 +248,11 @@ fun App() {
                 Button(
                     onClick = {
                         coroutineScope.launch {
+                            // --- Tambahkan ini untuk mereset data sebelumnya ---
+                            sensorMessages.clear() // Hapus semua pesan yang ada
+                            channelMap.clear() // Hapus semua data visualisasi yang ada
+                            // ----------------------------------------------------
+
                             val dataMessage = buildString {
                                 append("Mode:$mode;")
                                 append("${if (mode == "Linear") "Distance" else "Angle"}:$angleOrDistance;")
@@ -306,6 +311,7 @@ fun NavigationOverlayPage(
                 .fillMaxSize()
                 .padding(horizontal = 24.dp) // Apply horizontal padding
                 .padding(top = 16.dp) // Add some top padding below status bar
+                .padding(bottom = 60.dp)
                 .verticalScroll(scrollState),
             horizontalAlignment = Alignment.Start
         ) {
@@ -323,7 +329,7 @@ fun NavigationOverlayPage(
                                 .background(channelColors[channel % channelColors.size])
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Channel $channel")
+                        Text("Repetition $channel")
                     }
 
                     Spacer(modifier = Modifier.height(8.dp))
@@ -486,11 +492,10 @@ fun HeaderWithMicroscope() {
             .statusBarsPadding()
     ) {
         Image(
-            painter = painterResource(Res.drawable.interferometer_header),
+            painter = painterResource(Res.drawable.interferometer_header), // Menggunakan SVG
             contentDescription = "Header Illustration",
-            modifier = Modifier.fillMaxSize(), // Gambar akan mengisi seluruh Box header
+            modifier = Modifier.fillMaxSize(),
             contentScale = ContentScale.Crop
-            //contentScale = ContentScale.FillBounds // Penting: Agar gambar mengisi Box sepenuhnya
         )
     }
 }
