@@ -1,203 +1,437 @@
 package org.example.project
 
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.lightColorScheme
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateMapOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlin.random.Random
+import androidx.compose.ui.geometry.Offset
+
+
+@Composable
+fun HeaderSection(logo: Painter) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(160.dp)
+            .aspectRatio(16f/9f)
+    ) {
+        Image(
+            painter = logo,
+            contentDescription = "Header Image",
+            contentScale = ContentScale.FillWidth,
+            modifier = Modifier.fillMaxSize()
+        )
+    }
+}
+
+@Composable
+fun StatusIndicator(connected: Boolean, onToggle: () -> Unit) {
+    val text = if (connected) "Connected" else "Disconnected"
+    val color = if (connected) Color(0xFF1565C0) else Color(0xFFE53935)
+    Button(
+        onClick = onToggle,
+        colors = ButtonDefaults.buttonColors(containerColor = color),
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Text(text, color = Color.White)
+    }
+}
+
+@Composable
+fun ModeSelectionChipGroup(mode: String, onModeChange: (String) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Button(
+            onClick = { onModeChange("Linear") },
+            modifier = Modifier.weight(1f),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (mode == "Linear") Color(0xFF1565C0) else Color.White,
+                contentColor = if (mode == "Linear") Color.White else Color.Black
+            ),
+            border = ButtonDefaults.outlinedButtonBorder,
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            if (mode == "Linear") {
+                Icon(Icons.Default.Check, contentDescription = "Selected", modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+            }
+            Text("Linear")
+        }
+        Button(
+            onClick = { onModeChange("Rotasi") },
+            modifier = Modifier.weight(1f),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (mode == "Rotasi") Color(0xFF1565C0) else Color.White,
+                contentColor = if (mode == "Rotasi") Color.White else Color.Black
+            ),
+            border = ButtonDefaults.outlinedButtonBorder,
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            if (mode == "Rotasi") {
+                Icon(Icons.Default.Check, contentDescription = "Selected", modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+            }
+            Text("Rotasi")
+        }
+    }
+}
+
+@Composable
+fun DataPlotSection(channelMap: Map<Int, List<Int>>) {
+    val scrollState = rememberScrollState()
+    Box(
+        modifier = Modifier
+            .height(320.dp)
+            .verticalScroll(scrollState)
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            val sortedKeys = channelMap.keys.sorted()
+            if (sortedKeys.isEmpty()) { // Tambahkan kondisi untuk menampilkan pesan jika tidak ada data
+                Text(
+                    "No data to display. Start the process to receive MQTT data.",
+                    modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 80.dp),
+                    color = Color.Gray,
+                    fontSize = 14.sp
+                )
+            } else {
+                for (key in sortedKeys) {
+                    val values = channelMap[key] ?: emptyList()
+                    Text("Repetition $key", fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                    Canvas(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(100.dp)
+                            .padding(bottom = 12.dp)
+                    ) {
+                        if (values.isNotEmpty()) {
+                            val maxVal = values.maxOrNull()?.toFloat() ?: 100f
+                            val minVal = values.minOrNull()?.toFloat() ?: 0f
+                            val rangeVal = maxVal - minVal
+                            val normalizedMaxVal = if (rangeVal == 0f) maxVal + 10 else maxVal
+                            val scaleY = size.height / normalizedMaxVal
+
+                            // Draw horizontal grid
+                            val numHorizontalLines = 5
+                            for (i in 0 until numHorizontalLines) {
+                                val y = size.height - (i * (size.height / (numHorizontalLines - 1)))
+                                drawLine(
+                                    color = Color.Gray.copy(alpha = 0.3f),
+                                    start = Offset(0f, y),
+                                    end = Offset(size.width, y),
+                                    strokeWidth = 1f
+                                )
+                            }
+
+                            // Draw vertical grid
+                            val numVerticalLines = 10
+                            val stepXGrid = size.width / (numVerticalLines - 1).coerceAtLeast(1)
+                            for (i in 0 until numVerticalLines) {
+                                val x = i * stepXGrid
+                                drawLine(
+                                    color = Color.Gray.copy(alpha = 0.3f),
+                                    start = Offset(x, 0f),
+                                    end = Offset(x, size.height),
+                                    strokeWidth = 1f
+                                )
+                            }
+
+                            // Draw data lines
+                            val stepX = size.width / (values.size - 1).coerceAtLeast(1)
+                            for (i in 0 until values.size - 1) {
+                                val y1 = size.height - (values[i] - minVal) * scaleY
+                                val y2 = size.height - (values[i + 1] - minVal) * scaleY
+                                drawLine(
+                                    color = Color.Blue,
+                                    start = Offset(i * stepX, y1),
+                                    end = Offset((i + 1) * stepX, y2),
+                                    strokeWidth = 2f
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 @Composable
 fun DesktopUI() {
-    MaterialTheme(
-        colorScheme = lightColorScheme(
-            primary = Color(0xFF3E64FF),
-            onPrimary = Color.White,
-            secondary = Color(0xFF03A9F4),
-            onSecondary = Color.White,
-            background = Color(0xFFF3F6FD),
-            onBackground = Color.Black,
-            surface = Color.White,
-            onSurface = Color.Black,
-            primaryContainer = Color(0xFF3E64FF),
-            onPrimaryContainer = Color.White
-        )
-    ) {
-        val scrollState = rememberScrollState()
-        val coroutineScope = rememberCoroutineScope()
+    var connected by remember { mutableStateOf(false) }
+    var mode by remember { mutableStateOf("Rotasi") }
+    var angle by remember { mutableStateOf("") }
+    var speed by remember { mutableStateOf("") }
+    var repetitions by remember { mutableStateOf("") }
+    var showPlot by remember { mutableStateOf(false) } 
+    val sensorMessagesList = remember { mutableStateListOf<String>() }
+    var channelMap by remember { mutableStateOf<MutableMap<Int, MutableList<Int>>>(mutableStateMapOf()) }
 
-        val channelMap = remember { mutableStateMapOf<Int, MutableList<Int>>() }
-        val sensorMessages = remember { mutableStateListOf<String>() }
+    var showAlertDialog by remember { mutableStateOf(false) }
 
-        var mode by remember { mutableStateOf("Rotasi") }
-        var angleOrDistance by remember { mutableStateOf("") }
-        var speed by remember { mutableStateOf("") }
-        var repetitions by remember { mutableStateOf("") }
-        var status by remember { mutableStateOf("Disconnected") }
+    val coroutineScope = rememberCoroutineScope()
 
-        LaunchedEffect(Unit) {
-            MQTTClient.onMessageReceived = { message ->
+    LaunchedEffect(Unit) {
+        MQTTClient.onMessageReceived = { message ->
+            coroutineScope.launch(Dispatchers.Main) {
                 val isControlMessage = message.contains("Mode:") && message.contains("START")
                 if (!isControlMessage) {
                     message.lines().forEach { line ->
                         val parts = line.split(":")
                         val channel = parts.getOrNull(0)?.toIntOrNull()
                         val value = parts.getOrNull(1)?.toIntOrNull()
+
                         if (channel != null && value != null) {
-                            sensorMessages.add(line)
-                            if (sensorMessages.size > 200) sensorMessages.removeFirst()
-                            val list = channelMap.getOrPut(channel) { mutableListOf() }
+                            sensorMessagesList.add(line)
+                            if (sensorMessagesList.size > 200) {
+                                sensorMessagesList.removeFirst()
+                            }
+
+                            val list = channelMap.getOrPut(channel) { mutableStateListOf() }
                             list.add(value)
-                            if (list.size > 100) list.removeFirst()
+                            if (list.size > 100) {
+                                list.removeFirst()
+                            }
+                            showPlot = true
                         }
                     }
                 }
             }
         }
+    }
 
-        Surface(
-            modifier = Modifier.fillMaxSize().padding(32.dp)
+    // AlertDialog Composable
+    if (showAlertDialog) {
+        AlertDialog(
+            onDismissRequest = { showAlertDialog = false },
+            title = {
+                Text(
+                    text = "Invalid Input",
+                    color = Color.White
+                )
+            },
+            text = {
+                Text(
+                    text = "Input must be a number.",
+                    color = Color.White
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = { showAlertDialog = false },
+
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.White,
+                        contentColor = Color.Red
+                    )
+                ) {
+                    Text("OK")
+                }
+            },
+            // --- BAGIAN UTAMA UNTUK MENGUBAH BACKGROUND DIALOG ---
+            containerColor = Color(0xFFE53935),
+
+        )
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFFEAF3FF))
+    ) {
+        HeaderSection(painterResource("interferometer_header.png"))
+
+        Card(
+            modifier = Modifier
+                .fillMaxSize()
+                .offset(y = (-12).dp),
+            shape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White)
         ) {
             Column(
-                modifier = Modifier.fillMaxSize().verticalScroll(scrollState),
-                verticalArrangement = Arrangement.Top
+                modifier = Modifier
+                    .padding(16.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                OutlinedTextField(
-                    value = sensorMessages.joinToString("\n"),
-                    onValueChange = { },
-                    label = { Text("MQTT Messages") },
-                    modifier = Modifier.fillMaxWidth().height(200.dp),
-                    readOnly = true
-                )
-
-                Spacer(Modifier.height(16.dp))
-
-                Button(onClick = {
-                    coroutineScope.launch {
-                        sensorMessages.clear()
-                        channelMap.clear()
-                        val dataMessage = buildString {
-                            append("Mode:$mode;")
-                            append("${if (mode == "Linear") "Distance" else "Angle"}:$angleOrDistance;")
-                            append("Speed:$speed;")
-                            append("Repetitions:$repetitions;")
-                            append("START")
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Card(modifier = Modifier.fillMaxWidth().height(195.dp), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))) {
+                            Column(Modifier.padding(12.dp)) {
+                                Text("MQTT Messages", fontWeight = FontWeight.SemiBold)
+                                OutlinedTextField(
+                                    value = sensorMessagesList.joinToString("\n"),
+                                    onValueChange = {},
+                                    modifier = Modifier.fillMaxWidth().height(190.dp),
+                                    readOnly = true,
+                                    singleLine = false
+                                )
+                            }
                         }
-                        MQTTClient.publish(dataMessage)
-                    }
-                }) {
-                    Text("START")
-                }
 
-                Spacer(Modifier.height(16.dp))
+                        Spacer(modifier = Modifier.height(16.dp))
 
-                Text("Status: $status")
-                Button(onClick = {
-                    coroutineScope.launch {
-                        if (status == "Connected") {
-                            MQTTClient.disconnect()
-                            status = "Disconnected"
-                        } else {
-                            MQTTClient.connect()
-                            status = "Connected"
+                        Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))) {
+                            Column(Modifier.padding(12.dp)) {
+                                Text("Status", fontWeight = FontWeight.SemiBold)
+                                StatusIndicator(connected) {
+                                    if (connected) {
+                                        MQTTClient.disconnect()
+                                    } else {
+                                        MQTTClient.connect()
+                                    }
+                                    connected = !connected
+                                }
+                            }
                         }
-                    }
-                }) {
-                    Text(if (status == "Connected") "Disconnect" else "Connect")
-                }
 
-                Spacer(Modifier.height(16.dp))
+                        Spacer(modifier = Modifier.height(16.dp))
 
-                Text("Mode")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Linear", "Rotasi").forEach {
-                        Button(onClick = {
-                            mode = it
-                            angleOrDistance = ""
-                            speed = ""
-                            repetitions = ""
-                        }) {
-                            Text(it)
+                        Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))) {
+                            Column(Modifier.padding(12.dp)) {
+                                Text("Mode", fontWeight = FontWeight.SemiBold)
+                                ModeSelectionChipGroup(mode) { newMode ->
+                                    if (mode != newMode) {
+                                        mode = newMode
+                                        angle = ""
+                                        speed = ""
+                                        repetitions = ""
+                                    }
+                                }
+                            }
                         }
                     }
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Card(modifier = Modifier
+                            .fillMaxWidth()
+                            .height(408.dp),
+                            shape = RoundedCornerShape(16.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))) {
+                            Column(Modifier.padding(12.dp)) {
+                                Text("Data Visualization", fontWeight = FontWeight.SemiBold)
+                                Button(
+                                    onClick = {
+                                        showPlot = !showPlot // Toggle visibilitas plot
+                                        if (!showPlot) { // Jika plot disembunyikan, hapus datanya
+                                            channelMap.clear()
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Text(if (showPlot) "Hide Plot" else "Show Plot", color = Color.White)
+                                }
+                                if (showPlot) {
+                                    Spacer(Modifier.height(2.dp))
+                                    DataPlotSection(channelMap)
+                                }
+                            }
+                        }
+                    }
                 }
 
-                Spacer(Modifier.height(16.dp))
-                OutlinedTextField(
-                    value = angleOrDistance,
-                    onValueChange = { angleOrDistance = it },
-                    label = { Text(if (mode == "Linear") "Distance" else "Angle") },
-                    keyboardOptions = KeyboardOptions.Default.copy(keyboardType = KeyboardType.Number, imeAction = ImeAction.Next),
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = speed,
-                    onValueChange = { speed = it },
-                    label = { Text("Speed") },
-                    keyboardOptions = KeyboardOptions.Default.copy(keyboardType = KeyboardType.Number, imeAction = ImeAction.Next),
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = repetitions,
-                    onValueChange = { repetitions = it },
-                    label = { Text("Repetitions") },
-                    keyboardOptions = KeyboardOptions.Default.copy(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                Spacer(Modifier.height(32.dp))
-                Text("Visualization")
-                channelMap.forEach { (channel, values) ->
-                    Text("Repetition $channel")
-                    Canvas(modifier = Modifier.fillMaxWidth().height(200.dp)) {
-                        val padding = 32f
-                        val maxData = (values.maxOrNull() ?: 0).coerceAtLeast(1)
-                        val xStep = if (values.size > 1) (size.width - 2 * padding) / (values.size - 1) else 1f
-                        val yStep = (size.height - 2 * padding) / maxData
-                        for (i in 0 until values.size - 1) {
-                            val x1 = padding + i * xStep
-                            val y1 = size.height - padding - (values[i] * yStep)
-                            val x2 = padding + (i + 1) * xStep
-                            val y2 = size.height - padding - (values[i + 1] * yStep)
-                            drawLine(
-                                color = Color.Blue,
-                                start = Offset(x1, y1),
-                                end = Offset(x2, y2),
-                                strokeWidth = 4f
+                // Settings
+                Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("Settings", fontWeight = FontWeight.SemiBold)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(
+                                value = angle,
+                                onValueChange = { newValue ->
+                                    if (newValue.isEmpty() || newValue.matches(Regex("^\\d+\$"))) {
+                                        angle = newValue
+                                    } else {
+                                        showAlertDialog = true
+                                    }
+                                },
+                                label = { Text(if (mode == "Rotasi") "Angle" else "Distance") },
+                                modifier = Modifier.weight(1f),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                            )
+                            OutlinedTextField(
+                                value = speed,
+                                onValueChange = { newValue ->
+                                    if (newValue.isEmpty() || newValue.matches(Regex("^\\d+\$"))) {
+                                        speed = newValue
+                                    } else {
+                                        showAlertDialog = true
+                                    }
+                                },
+                                label = { Text("Speed") },
+                                modifier = Modifier.weight(1f),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                            )
+                            OutlinedTextField(
+                                value = repetitions,
+                                onValueChange = { newValue ->
+                                    if (newValue.isEmpty() || newValue.matches(Regex("^\\d+\$"))) {
+                                        repetitions = newValue
+                                    } else {
+                                        showAlertDialog = true
+                                    }
+                                },
+                                label = { Text("Repetitions") },
+                                modifier = Modifier.weight(1f),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
                             )
                         }
+                    }
+                }
+
+                // Start
+                Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))) {
+                    Column(Modifier.padding(12.dp), horizontalAlignment = Alignment.End) {
+                        Button(
+                            onClick = {
+                                if (angle.toIntOrNull() == null && angle.isNotEmpty() ||
+                                    speed.toIntOrNull() == null && speed.isNotEmpty() ||
+                                    repetitions.toIntOrNull() == null && repetitions.isNotEmpty()) {
+                                    showAlertDialog = true
+                                } else if (connected) {
+                                    sensorMessagesList.clear()
+                                    channelMap.clear() // Hapus data plot saat Start ditekan
+                                    showPlot = true // Pastikan plot terlihat ketika proses dimulai
+
+                                    val command = "Mode:$mode;${if (mode == "Rotasi") "Angle" else "Distance"}:$angle;Speed:$speed;Repetitions:$repetitions;START"
+                                    MQTTClient.publish(command)
+                                } else {
+                                    println("Not connected to MQTT broker.")
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text("Start", color = Color.White)
+                        }
+
                     }
                 }
             }

@@ -38,6 +38,7 @@ kotlin {
             implementation(libs.androidx.activity.compose)
             implementation("org.eclipse.paho:org.eclipse.paho.android.service:1.1.1")
             implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
+
         }
         commonMain.dependencies {
             implementation(compose.runtime)
@@ -85,6 +86,7 @@ android {
 }
 
 dependencies {
+    implementation(libs.androidx.ui.geometry.desktop)
     debugImplementation(compose.uiTooling)
 }
 
