@@ -12,4 +12,8 @@ actual object MQTTClient {
     actual fun publish(message: String) {
         println("MQTT not implemented for iOS. Tried to publish: $message")
     }
+
+    actual var onMessageReceived: (String) -> Unit
+        get() = TODO("Not yet implemented")
+        set(value) {}
 }
