@@ -1,12 +1,15 @@
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.lang.ProcessBuilder.Redirect.from
 
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
     alias(libs.plugins.androidApplication)
     alias(libs.plugins.composeMultiplatform)
     alias(libs.plugins.composeCompiler)
+    alias(libs.plugins.swiftklib)
+
 }
 
 kotlin {
@@ -24,14 +27,50 @@ kotlin {
     ).forEach { iosTarget ->
         iosTarget.binaries.framework {
             baseName = "ComposeApp"
-            isStatic = true
+            isStatic = false
+        }
+
+        iosTarget.compilations["main"].cinterops {
+            create("mqtt") {
+                from(project.file("src/nativeInterop/cinterop/mqtt/mqtt.def"))
+            }
         }
     }
+
+
+//    listOf(
+//        iosX64(),
+//        iosArm64(),
+//        iosSimulatorArm64()
+//    ).forEach { iosTarget ->
+//        iosTarget.binaries.framework {
+//            baseName = "ComposeApp"
+//            isStatic = false
+//        }
+//        iosTarget.compilations{
+//            val main by getting{
+//                cinterops{
+//                    create("mqtt")
+//                    from(project.file("src/nativeInterop/cinterop/mqtt/mqtt.def"))
+//                }
+//            }
+//        }
+//    }
 
     jvm("desktop")
 
     sourceSets {
         val desktopMain by getting
+
+        val iosX64Main by getting
+        val iosArm64Main by getting
+        val iosSimulatorArm64Main by getting
+        val iosMain by creating {
+            dependsOn(commonMain.get())
+            iosX64Main.dependsOn(this)
+            iosArm64Main.dependsOn(this)
+            iosSimulatorArm64Main.dependsOn(this)
+        }
 
         androidMain.dependencies {
             implementation(compose.preview)
@@ -88,6 +127,13 @@ android {
 dependencies {
     //implementation(libs.androidx.ui.geometry.desktop)
     debugImplementation(compose.uiTooling)
+}
+
+swiftklib{
+    create("mqtt"){
+        path = file("../iosApp/iosApp/mqtt")
+        packageName("com.minuscool.mqtt")
+    }
 }
 
 compose.desktop {
