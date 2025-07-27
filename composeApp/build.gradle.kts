@@ -86,7 +86,7 @@ android {
 }
 
 dependencies {
-    implementation(libs.androidx.ui.geometry.desktop)
+    //implementation(libs.androidx.ui.geometry.desktop)
     debugImplementation(compose.uiTooling)
 }
 

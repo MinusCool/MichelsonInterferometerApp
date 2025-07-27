@@ -338,9 +338,6 @@ fun DesktopUI() {
                                 Button(
                                     onClick = {
                                         showPlot = !showPlot // Toggle visibilitas plot
-                                        if (!showPlot) { // Jika plot disembunyikan, hapus datanya
-                                            channelMap.clear()
-                                        }
                                     },
                                     modifier = Modifier.fillMaxWidth(),
                                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
