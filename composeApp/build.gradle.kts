@@ -10,6 +10,9 @@ plugins {
 }
 
 kotlin {
+    // Gunakan JDK 17
+    jvmToolchain(17)
+
     androidTarget {
         @OptIn(ExperimentalKotlinGradlePluginApi::class)
         compilerOptions {
@@ -17,6 +20,7 @@ kotlin {
         }
     }
 
+    // Target iOS
     listOf(
         iosX64(),
         iosArm64(),
@@ -28,6 +32,7 @@ kotlin {
         }
     }
 
+    // Desktop target
     jvm("desktop")
 
     sourceSets {
@@ -38,8 +43,8 @@ kotlin {
             implementation(libs.androidx.activity.compose)
             implementation("org.eclipse.paho:org.eclipse.paho.android.service:1.1.1")
             implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
-
         }
+
         commonMain.dependencies {
             implementation(compose.runtime)
             implementation(compose.foundation)
@@ -50,6 +55,7 @@ kotlin {
             implementation(libs.androidx.lifecycle.viewmodel)
             implementation(libs.androidx.lifecycle.runtime.compose)
         }
+
         desktopMain.dependencies {
             implementation(compose.desktop.currentOs)
             implementation(libs.kotlinx.coroutines.swing)
@@ -69,16 +75,19 @@ android {
         versionCode = 1
         versionName = "1.0"
     }
+
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
     buildTypes {
         getByName("release") {
-            isMinifyEnabled = false
+            isMinifyEnabled = false // 🔧 Nonaktifkan ProGuard di Android
         }
     }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
@@ -86,18 +95,44 @@ android {
 }
 
 dependencies {
-    //implementation(libs.androidx.ui.geometry.desktop)
     debugImplementation(compose.uiTooling)
 }
-
+tasks.matching { it.name.contains("proguard", ignoreCase = true) }.configureEach {
+    enabled = false
+}
 compose.desktop {
     application {
         mainClass = "org.example.project.MainKt"
 
+        // 👇 Tambahan penting untuk mem-bypass ProGuard
+        buildTypes.release.proguard {
+            isEnabled.set(false) // pastikan proguard off
+        }
+
+        // 👇 Override path JAR agar tidak mencari hasil ProGuard
+        fromFiles(
+            file("build/compose/jars/main/composeApp-desktop.jar")
+        )
+
         nativeDistributions {
-            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
-            packageName = "org.example.project"
+            targetFormats(TargetFormat.Exe)
+            packageName = "InterferometerApp"
             packageVersion = "1.0.0"
+            description = "MyApp description"
+            vendor = "MyCompany"
+
+            windows {
+                iconFile.set(project.file("src/desktopMain/resources/icon.png"))
+            }
         }
     }
 }
+
+// 🚫 Jaga-jaga: pastikan ProGuard benar-benar tidak dijalankan
+gradle.taskGraph.whenReady {
+    allTasks.filter { it.name.contains("proguard", ignoreCase = true) }.forEach {
+        it.enabled = false
+        println("⚠️ Disabled task: ${it.name}")
+    }
+}
+
