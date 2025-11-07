@@ -11,7 +11,7 @@ fun main() = application {
     Window(
         onCloseRequest = ::exitApplication,
         title = "InterferometerApp" ,
-        state = WindowState(width = 800.dp, height = 850.dp),
+        state = WindowState(width = 1200.dp, height = 950.dp),
         resizable = false,
         icon = painterResource("icon.png")
     ) {
