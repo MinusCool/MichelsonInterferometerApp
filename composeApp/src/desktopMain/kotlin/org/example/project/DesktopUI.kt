@@ -15,6 +15,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.layout.ContentScale
@@ -23,11 +24,52 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlin.math.*
 import java.io.File
+
+/* ======================== PREMIUM UI TOKENS ============================ */
+
+private object PremiumTokens {
+    val BgTop = Color(0xFFF7F9FF)
+    val BgBottom = Color(0xFFEFF3FF)
+
+    val Surface = Color(0xFFFFFFFF)
+    val SurfaceAlt = Color(0xFFF4F7FF)
+
+    val Primary = Color(0xFF1E40AF)
+    val PrimarySoft = Color(0xFFE8EEFF)
+    val Accent = Color(0xFF0EA5E9)
+    val Danger = Color(0xFFDC2626)
+
+    val Text = Color(0xFF0F172A)
+    val TextMuted = Color(0xFF64748B)
+    val Border = Color(0xFFE2E8F0)
+
+    val CardShape = RoundedCornerShape(18.dp)
+    val SheetShape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp)
+
+    // FIX: elevation factories ini @Composable, jadi HARUS dipanggil dari composable context
+    @Composable
+    fun cardElevation() = CardDefaults.cardElevation(
+        defaultElevation = 10.dp,
+        pressedElevation = 12.dp,
+        focusedElevation = 12.dp,
+        hoveredElevation = 12.dp,
+        draggedElevation = 14.dp,
+        disabledElevation = 0.dp
+    )
+
+    @Composable
+    fun buttonElevation() = ButtonDefaults.buttonElevation(
+        defaultElevation = 8.dp,
+        pressedElevation = 10.dp,
+        focusedElevation = 10.dp,
+        hoveredElevation = 10.dp,
+        disabledElevation = 0.dp
+    )
+}
 
 /* ======================== MQTT + UI ============================ */
 
@@ -39,8 +81,17 @@ fun HeaderSection(logo: Painter) {
         Image(
             painter = logo,
             contentDescription = "Header Image",
-            contentScale = ContentScale.FillWidth,
+            contentScale = ContentScale.Crop,
             modifier = Modifier.fillMaxSize()
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(Color.Black.copy(alpha = 0.10f), Color.Transparent)
+                    )
+                )
         )
     }
 }
@@ -48,14 +99,20 @@ fun HeaderSection(logo: Painter) {
 @Composable
 fun StatusIndicator(connected: Boolean, onToggle: () -> Unit) {
     val text = if (connected) "Connected" else "Disconnected"
-    val color = if (connected) Color(0xFF1565C0) else Color(0xFFE53935)
+    val color = if (connected) PremiumTokens.Primary else PremiumTokens.Danger
     Button(
         onClick = onToggle,
-        colors = ButtonDefaults.buttonColors(containerColor = color),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = color,
+            contentColor = Color.White,
+            disabledContainerColor = color.copy(alpha = 0.45f),
+            disabledContentColor = Color.White.copy(alpha = 0.7f)
+        ),
+        elevation = PremiumTokens.buttonElevation(),
         shape = RoundedCornerShape(16.dp),
         modifier = Modifier.fillMaxWidth()
     ) {
-        Text(text, color = Color.White)
+        Text(text, fontWeight = FontWeight.SemiBold, letterSpacing = 0.2.sp)
     }
 }
 
@@ -66,33 +123,48 @@ fun ModeSelectionChipGroup(mode: String, onModeChange: (String) -> Unit) {
             onClick = { onModeChange("Linear") },
             modifier = Modifier.weight(1f),
             colors = ButtonDefaults.buttonColors(
-                containerColor = if (mode == "Linear") Color(0xFF1565C0) else Color.White,
-                contentColor = if (mode == "Linear") Color.White else Color.Black
+                containerColor = if (mode == "Linear") PremiumTokens.Primary else PremiumTokens.Surface,
+                contentColor = if (mode == "Linear") Color.White else PremiumTokens.Text
             ),
-            border = ButtonDefaults.outlinedButtonBorder,
+            elevation = ButtonDefaults.buttonElevation(
+                defaultElevation = if (mode == "Linear") 8.dp else 2.dp,
+                pressedElevation = 10.dp
+            ),
+            border = ButtonDefaults.outlinedButtonBorder.copy(
+                brush = Brush.linearGradient(listOf(PremiumTokens.Border, PremiumTokens.Border)),
+                width = 1.dp
+            ),
             shape = RoundedCornerShape(16.dp)
         ) {
             if (mode == "Linear") {
                 Icon(Icons.Default.Check, contentDescription = "Selected", modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(4.dp))
             }
-            Text("Linear")
+            Text("Linear", fontWeight = FontWeight.SemiBold)
         }
+
         Button(
             onClick = { onModeChange("Rotasi") },
             modifier = Modifier.weight(1f),
             colors = ButtonDefaults.buttonColors(
-                containerColor = if (mode == "Rotasi") Color(0xFF1565C0) else Color.White,
-                contentColor = if (mode == "Rotasi") Color.White else Color.Black
+                containerColor = if (mode == "Rotasi") PremiumTokens.Primary else PremiumTokens.Surface,
+                contentColor = if (mode == "Rotasi") Color.White else PremiumTokens.Text
             ),
-            border = ButtonDefaults.outlinedButtonBorder,
+            elevation = ButtonDefaults.buttonElevation(
+                defaultElevation = if (mode == "Rotasi") 8.dp else 2.dp,
+                pressedElevation = 10.dp
+            ),
+            border = ButtonDefaults.outlinedButtonBorder.copy(
+                brush = Brush.linearGradient(listOf(PremiumTokens.Border, PremiumTokens.Border)),
+                width = 1.dp
+            ),
             shape = RoundedCornerShape(16.dp)
         ) {
             if (mode == "Rotasi") {
                 Icon(Icons.Default.Check, contentDescription = "Selected", modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(4.dp))
             }
-            Text("Rotasi")
+            Text("Rotasi", fontWeight = FontWeight.SemiBold)
         }
     }
 }
@@ -109,13 +181,18 @@ fun DataPlotSection(channelMap: Map<Int, List<Int>>, filteredMap: Map<Int, List<
                 Text(
                     "No data to display. Start the process to receive MQTT data.",
                     modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 80.dp),
-                    color = Color.Gray, fontSize = 14.sp
+                    color = PremiumTokens.TextMuted, fontSize = 14.sp, fontWeight = FontWeight.Medium
                 )
             } else {
                 for (key in sortedKeys) {
                     val values = channelMap[key] ?: emptyList()
                     val filteredValues = filteredMap[key] ?: emptyList()
-                    Text("Repetition $key", fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                    Text(
+                        "Repetition $key",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = PremiumTokens.Text
+                    )
                     Canvas(
                         modifier = Modifier.fillMaxWidth().height(100.dp).padding(bottom = 12.dp)
                     ) {
@@ -126,31 +203,42 @@ fun DataPlotSection(channelMap: Map<Int, List<Int>>, filteredMap: Map<Int, List<
                             val scaleY = size.height / rangeVal
                             val stepX = size.width / (values.size - 1).coerceAtLeast(1)
 
-                            // Grid
+                            // Grid (lebih halus)
                             val numHorizontalLines = 5
                             repeat(numHorizontalLines) {
                                 val y = it * (size.height / (numHorizontalLines - 1))
-                                drawLine(Color.Gray.copy(alpha = 0.3f), Offset(0f, y), Offset(size.width, y), 1f)
+                                drawLine(
+                                    PremiumTokens.Border.copy(alpha = 0.55f),
+                                    Offset(0f, y),
+                                    Offset(size.width, y),
+                                    1f
+                                )
                             }
                             val numVerticalLines = 10
                             val stepXGrid = size.width / (numVerticalLines - 1).coerceAtLeast(1)
                             repeat(numVerticalLines) {
                                 val x = it * stepXGrid
-                                drawLine(Color.Gray.copy(alpha = 0.3f), Offset(x, 0f), Offset(x, size.height), 1f)
+                                drawLine(
+                                    PremiumTokens.Border.copy(alpha = 0.55f),
+                                    Offset(x, 0f),
+                                    Offset(x, size.height),
+                                    1f
+                                )
                             }
 
-                            // Raw line (cyan)
+                            // Raw line (accent)
                             for (i in 0 until values.size - 1) {
-                                val y1 = size.height - (values[i] - minVal) * scaleY
-                                val y2 = size.height - (values[i + 1] - minVal) * scaleY
-                                drawLine(Color.Cyan, Offset(i * stepX, y1), Offset((i + 1) * stepX, y2), 2f)
+                                val y1 = size.height - ((values[i].toFloat() - minVal) * scaleY)
+                                val y2 = size.height - ((values[i + 1].toFloat() - minVal) * scaleY)
+                                drawLine(PremiumTokens.Accent, Offset(i * stepX, y1), Offset((i + 1) * stepX, y2), 2f)
                             }
 
-                            // Filtered line (orange)
+                            // Filtered line (gold)
+                            val premiumGold = Color(0xFFF59E0B)
                             for (i in 0 until filteredValues.size - 1) {
-                                val y1 = size.height - (filteredValues[i] - minVal) * scaleY
-                                val y2 = size.height - (filteredValues[i + 1] - minVal) * scaleY
-                                drawLine(Color(0xFFFFA500), Offset(i * stepX, y1), Offset((i + 1) * stepX, y2), 2f)
+                                val y1 = size.height - ((filteredValues[i].toFloat() - minVal) * scaleY)
+                                val y2 = size.height - ((filteredValues[i + 1].toFloat() - minVal) * scaleY)
+                                drawLine(premiumGold, Offset(i * stepX, y1), Offset((i + 1) * stepX, y2), 2f)
                             }
                         }
                     }
@@ -171,11 +259,11 @@ fun DesktopUI() {
     var repetitions by remember { mutableStateOf("") }
     var showPlot by remember { mutableStateOf(false) }
 
-
     val sensorMessagesList = remember { mutableStateListOf<String>() }
     var channelMap by remember { mutableStateOf<MutableMap<Int, MutableList<Int>>>(mutableStateMapOf()) }
     var filteredMap by remember { mutableStateOf<MutableMap<Int, MutableList<Int>>>(mutableStateMapOf()) }
     var showAlertDialog by remember { mutableStateOf(false) }
+
     // Filter states
     var selectedFilter by remember { mutableStateOf("SG") }
     var sgWindow by remember { mutableStateOf(7) }
@@ -184,7 +272,6 @@ fun DesktopUI() {
     var kalmanR by remember { mutableStateOf(1.0f) }
 
     val filters = listOf("SG", "Kalman")
-
     val coroutineScope = rememberCoroutineScope()
 
     LaunchedEffect(Unit) {
@@ -212,33 +299,58 @@ fun DesktopUI() {
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize().background(Color(0xFFEAF3FF))) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(listOf(PremiumTokens.BgTop, PremiumTokens.BgBottom))
+            )
+    ) {
         HeaderSection(painterResource("interferometer_header.png"))
 
         Card(
             modifier = Modifier.fillMaxSize().offset(y = (-12).dp),
-            shape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White)
+            shape = PremiumTokens.SheetShape,
+            colors = CardDefaults.cardColors(containerColor = PremiumTokens.Surface),
+            elevation = PremiumTokens.cardElevation()
         ) {
             Column(
                 modifier = Modifier.padding(16.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+
                     Column(modifier = Modifier.weight(1f)) {
                         Card(
                             modifier = Modifier.fillMaxWidth().height(195.dp),
-                            shape = RoundedCornerShape(16.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))
+                            shape = PremiumTokens.CardShape,
+                            colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
+                            elevation = PremiumTokens.cardElevation()
                         ) {
                             Column(Modifier.padding(12.dp)) {
-                                Text("MQTT Messages", fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "MQTT Messages",
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = PremiumTokens.Text,
+                                    letterSpacing = 0.2.sp
+                                )
                                 OutlinedTextField(
                                     value = sensorMessagesList.joinToString("\n"),
                                     onValueChange = {},
                                     modifier = Modifier.fillMaxWidth().height(190.dp),
                                     readOnly = true,
-                                    singleLine = false
+                                    singleLine = false,
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = PremiumTokens.Primary.copy(alpha = 0.55f),
+                                        unfocusedBorderColor = PremiumTokens.Border,
+                                        focusedLabelColor = PremiumTokens.Primary,
+                                        cursorColor = PremiumTokens.Primary,
+                                        focusedTextColor = PremiumTokens.Text,
+                                        unfocusedTextColor = PremiumTokens.Text,
+                                        disabledBorderColor = PremiumTokens.Border,
+                                        disabledTextColor = PremiumTokens.TextMuted
+                                    ),
+                                    shape = RoundedCornerShape(14.dp)
                                 )
                             }
                         }
@@ -247,11 +359,12 @@ fun DesktopUI() {
 
                         Card(
                             modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(16.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))
+                            shape = PremiumTokens.CardShape,
+                            colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
+                            elevation = PremiumTokens.cardElevation()
                         ) {
                             Column(Modifier.padding(12.dp)) {
-                                Text("Status", fontWeight = FontWeight.SemiBold)
+                                Text("Status", fontWeight = FontWeight.SemiBold, color = PremiumTokens.Text)
                                 StatusIndicator(connected) {
                                     if (connected) MQTTClient.disconnect() else MQTTClient.connect()
                                     connected = !connected
@@ -263,32 +376,41 @@ fun DesktopUI() {
 
                         Card(
                             modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(16.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))
+                            shape = PremiumTokens.CardShape,
+                            colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
+                            elevation = PremiumTokens.cardElevation()
                         ) {
                             Column(Modifier.padding(12.dp)) {
-                                Text("Mode", fontWeight = FontWeight.SemiBold)
+                                Text("Mode", fontWeight = FontWeight.SemiBold, color = PremiumTokens.Text)
                                 ModeSelectionChipGroup(mode) { newMode -> mode = newMode }
                             }
                         }
                     }
-                    Row(modifier = Modifier.weight(2f), horizontalArrangement = Arrangement.spacedBy(16.dp))
-                    {
+
+                    Row(modifier = Modifier.weight(2f), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                         Column(modifier = Modifier.weight(1f)) {
                             Card(
                                 modifier = Modifier.fillMaxWidth().height(408.dp),
-                                shape = RoundedCornerShape(16.dp),
-                                colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))
+                                shape = PremiumTokens.CardShape,
+                                colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
+                                elevation = PremiumTokens.cardElevation()
                             ) {
                                 Column(Modifier.padding(12.dp)) {
-                                    Text("Data Visualization", fontWeight = FontWeight.SemiBold)
+                                    Text("Data Visualization", fontWeight = FontWeight.SemiBold, color = PremiumTokens.Text)
                                     Button(
                                         onClick = { showPlot = !showPlot },
                                         modifier = Modifier.fillMaxWidth(),
-                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = PremiumTokens.Primary,
+                                            contentColor = Color.White
+                                        ),
+                                        elevation = PremiumTokens.buttonElevation(),
                                         shape = RoundedCornerShape(12.dp)
                                     ) {
-                                        Text(if (showPlot) "Hide Plot" else "Show Plot", color = Color.White)
+                                        Text(
+                                            if (showPlot) "Hide Plot" else "Show Plot",
+                                            fontWeight = FontWeight.SemiBold
+                                        )
                                     }
                                     if (showPlot) {
                                         Spacer(Modifier.height(2.dp))
@@ -304,8 +426,9 @@ fun DesktopUI() {
                         modifier = Modifier
                             .weight(1f)
                             .height(400.dp),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))
+                        shape = PremiumTokens.CardShape,
+                        colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
+                        elevation = PremiumTokens.cardElevation()
                     ) {
                         Column(
                             Modifier
@@ -316,12 +439,11 @@ fun DesktopUI() {
                                 "Filter Settings",
                                 fontWeight = FontWeight.SemiBold,
                                 fontSize = 16.sp,
-                                color = Color.Black
+                                color = PremiumTokens.Text
                             )
 
                             Spacer(Modifier.height(8.dp))
 
-                            // --- Tombol Pilihan Filter (gaya sama dengan Mode) ---
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -331,10 +453,17 @@ fun DesktopUI() {
                                         onClick = { selectedFilter = filter },
                                         modifier = Modifier.weight(1f),
                                         colors = ButtonDefaults.buttonColors(
-                                            containerColor = if (selectedFilter == filter) Color(0xFF1565C0) else Color.White,
-                                            contentColor = if (selectedFilter == filter) Color.White else Color(0xFF1565C0)
+                                            containerColor = if (selectedFilter == filter) PremiumTokens.Primary else PremiumTokens.Surface,
+                                            contentColor = if (selectedFilter == filter) Color.White else PremiumTokens.Text
                                         ),
-                                        border = ButtonDefaults.outlinedButtonBorder,
+                                        elevation = ButtonDefaults.buttonElevation(
+                                            defaultElevation = if (selectedFilter == filter) 8.dp else 2.dp,
+                                            pressedElevation = 10.dp
+                                        ),
+                                        border = ButtonDefaults.outlinedButtonBorder.copy(
+                                            brush = Brush.linearGradient(listOf(PremiumTokens.Border, PremiumTokens.Border)),
+                                            width = 1.dp
+                                        ),
                                         shape = RoundedCornerShape(16.dp)
                                     ) {
                                         if (selectedFilter == filter) {
@@ -345,120 +474,125 @@ fun DesktopUI() {
                                             )
                                             Spacer(Modifier.width(4.dp))
                                         }
-                                        Text(filter)
+                                        Text(filter, fontWeight = FontWeight.SemiBold)
                                     }
                                 }
                             }
 
                             Spacer(Modifier.height(12.dp))
 
-                            // --- Parameter Dinamis Berdasarkan Filter yang Dipilih ---
                             when (selectedFilter) {
-
-                                /* Savitzky–Golay Filter */
                                 "SG" -> {
                                     Text(
                                         "Savitzky–Golay Parameters",
-                                        color = Color.DarkGray,
+                                        color = PremiumTokens.TextMuted,
                                         fontWeight = FontWeight.Medium
                                     )
 
                                     Spacer(Modifier.height(6.dp))
-                                    Text("Window: $sgWindow", color = Color.Gray, fontSize = 13.sp)
+                                    Text("Window: $sgWindow", color = PremiumTokens.TextMuted, fontSize = 13.sp)
                                     Slider(
                                         value = sgWindow.toFloat(),
                                         onValueChange = { sgWindow = it.toInt().coerceIn(3, 301) },
                                         valueRange = 3f..301f,
                                         colors = SliderDefaults.colors(
-                                            thumbColor = Color(0xFF1565C0),
-                                            activeTrackColor = Color(0xFF1565C0),
-                                            inactiveTrackColor = Color(0xFF90CAF9)
+                                            thumbColor = PremiumTokens.Primary,
+                                            activeTrackColor = PremiumTokens.Primary,
+                                            inactiveTrackColor = PremiumTokens.PrimarySoft
                                         )
                                     )
 
                                     Spacer(Modifier.height(6.dp))
-                                    Text("Order: $sgOrder", color = Color.Gray, fontSize = 13.sp)
+                                    Text("Order: $sgOrder", color = PremiumTokens.TextMuted, fontSize = 13.sp)
                                     Slider(
                                         value = sgOrder.toFloat(),
                                         onValueChange = { sgOrder = it.toInt().coerceIn(2, 10) },
                                         valueRange = 2f..10f,
                                         colors = SliderDefaults.colors(
-                                            thumbColor = Color(0xFF1565C0),
-                                            activeTrackColor = Color(0xFF1565C0),
-                                            inactiveTrackColor = Color(0xFF90CAF9)
+                                            thumbColor = PremiumTokens.Primary,
+                                            activeTrackColor = PremiumTokens.Primary,
+                                            inactiveTrackColor = PremiumTokens.PrimarySoft
                                         )
                                     )
                                 }
 
-                                /* Kalman Filter */
                                 "Kalman" -> {
                                     Text(
                                         "Kalman Filter Parameters",
-                                        color = Color.DarkGray,
+                                        color = PremiumTokens.TextMuted,
                                         fontWeight = FontWeight.Medium
                                     )
 
                                     Spacer(Modifier.height(6.dp))
-                                    Text("Q (Process Noise): ${"%.4f".format(kalmanQ)}", color = Color.Gray, fontSize = 13.sp)
+                                    Text(
+                                        "Q (Process Noise): ${"%.4f".format(kalmanQ)}",
+                                        color = PremiumTokens.TextMuted,
+                                        fontSize = 13.sp
+                                    )
                                     Slider(
                                         value = kalmanQ,
                                         onValueChange = { kalmanQ = it.coerceIn(1e-5f, 10f) },
                                         valueRange = 1e-5f..10f,
                                         colors = SliderDefaults.colors(
-                                            thumbColor = Color(0xFF1565C0),
-                                            activeTrackColor = Color(0xFF1565C0),
-                                            inactiveTrackColor = Color(0xFF90CAF9)
+                                            thumbColor = PremiumTokens.Primary,
+                                            activeTrackColor = PremiumTokens.Primary,
+                                            inactiveTrackColor = PremiumTokens.PrimarySoft
                                         )
                                     )
 
                                     Spacer(Modifier.height(6.dp))
-                                    Text("R (Measurement Noise): ${"%.4f".format(kalmanR)}", color = Color.Gray, fontSize = 13.sp)
+                                    Text(
+                                        "R (Measurement Noise): ${"%.4f".format(kalmanR)}",
+                                        color = PremiumTokens.TextMuted,
+                                        fontSize = 13.sp
+                                    )
                                     Slider(
                                         value = kalmanR,
                                         onValueChange = { kalmanR = it.coerceIn(1e-4f, 20f) },
                                         valueRange = 1e-4f..20f,
                                         colors = SliderDefaults.colors(
-                                            thumbColor = Color(0xFF1565C0),
-                                            activeTrackColor = Color(0xFF1565C0),
-                                            inactiveTrackColor = Color(0xFF90CAF9)
+                                            thumbColor = PremiumTokens.Primary,
+                                            activeTrackColor = PremiumTokens.Primary,
+                                            inactiveTrackColor = PremiumTokens.PrimarySoft
                                         )
                                     )
                                 }
                             }
                         }
                     }
-                    }
-
+                }
 
                 /* =============== Settings & Start Cards =============== */
 
-                // === Pop-up Warning Dialog ===
                 if (showAlertDialog) {
                     AlertDialog(
                         onDismissRequest = { showAlertDialog = false },
-                        title = { Text("Invalid Input", color = Color.White) },
-                        text = { Text("Input must be a number.", color = Color.White) },
+                        title = { Text("Invalid Input", color = PremiumTokens.Text) },
+                        text = { Text("Input must be a number.", color = PremiumTokens.TextMuted) },
                         confirmButton = {
                             Button(
                                 onClick = { showAlertDialog = false },
                                 colors = ButtonDefaults.buttonColors(
-                                    containerColor = Color.White,
-                                    contentColor = Color(0xFFE53935)
-                                )
-                            ) { Text("OK") }
+                                    containerColor = PremiumTokens.Primary,
+                                    contentColor = Color.White
+                                ),
+                                elevation = PremiumTokens.buttonElevation()
+                            ) { Text("OK", fontWeight = FontWeight.SemiBold) }
                         },
-                        containerColor = Color(0xFFE53935)
+                        containerColor = PremiumTokens.Surface,
+                        tonalElevation = 10.dp
                     )
                 }
 
-// === Settings Card ===
+                // === Settings Card ===
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))
+                    shape = PremiumTokens.CardShape,
+                    colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
+                    elevation = PremiumTokens.cardElevation()
                 ) {
                     Column(Modifier.padding(12.dp)) {
-                        Text("Settings", fontWeight = FontWeight.SemiBold)
+                        Text("Settings", fontWeight = FontWeight.SemiBold, color = PremiumTokens.Text)
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -466,7 +600,7 @@ fun DesktopUI() {
                             OutlinedTextField(
                                 value = angle,
                                 onValueChange = { newValue ->
-                                    if (newValue.isEmpty() || newValue.matches(Regex("^\\d+\$"))) {
+                                    if (newValue.isEmpty() || newValue.matches(Regex("^\\d+$"))) {
                                         angle = newValue
                                     } else {
                                         showAlertDialog = true
@@ -474,12 +608,22 @@ fun DesktopUI() {
                                 },
                                 label = { Text(if (mode == "Rotasi") "Angle" else "Distance") },
                                 modifier = Modifier.weight(1f),
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = PremiumTokens.Primary,
+                                    unfocusedBorderColor = PremiumTokens.Border,
+                                    focusedLabelColor = PremiumTokens.Primary,
+                                    unfocusedLabelColor = PremiumTokens.TextMuted,
+                                    cursorColor = PremiumTokens.Primary,
+                                    focusedTextColor = PremiumTokens.Text,
+                                    unfocusedTextColor = PremiumTokens.Text
+                                ),
+                                shape = RoundedCornerShape(14.dp)
                             )
                             OutlinedTextField(
                                 value = speed,
                                 onValueChange = { newValue ->
-                                    if (newValue.isEmpty() || newValue.matches(Regex("^\\d+\$"))) {
+                                    if (newValue.isEmpty() || newValue.matches(Regex("^\\d+$"))) {
                                         speed = newValue
                                     } else {
                                         showAlertDialog = true
@@ -487,12 +631,22 @@ fun DesktopUI() {
                                 },
                                 label = { Text("Speed") },
                                 modifier = Modifier.weight(1f),
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = PremiumTokens.Primary,
+                                    unfocusedBorderColor = PremiumTokens.Border,
+                                    focusedLabelColor = PremiumTokens.Primary,
+                                    unfocusedLabelColor = PremiumTokens.TextMuted,
+                                    cursorColor = PremiumTokens.Primary,
+                                    focusedTextColor = PremiumTokens.Text,
+                                    unfocusedTextColor = PremiumTokens.Text
+                                ),
+                                shape = RoundedCornerShape(14.dp)
                             )
                             OutlinedTextField(
                                 value = repetitions,
                                 onValueChange = { newValue ->
-                                    if (newValue.isEmpty() || newValue.matches(Regex("^\\d+\$"))) {
+                                    if (newValue.isEmpty() || newValue.matches(Regex("^\\d+$"))) {
                                         repetitions = newValue
                                     } else {
                                         showAlertDialog = true
@@ -500,7 +654,17 @@ fun DesktopUI() {
                                 },
                                 label = { Text("Repetitions") },
                                 modifier = Modifier.weight(1f),
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = PremiumTokens.Primary,
+                                    unfocusedBorderColor = PremiumTokens.Border,
+                                    focusedLabelColor = PremiumTokens.Primary,
+                                    unfocusedLabelColor = PremiumTokens.TextMuted,
+                                    cursorColor = PremiumTokens.Primary,
+                                    focusedTextColor = PremiumTokens.Text,
+                                    unfocusedTextColor = PremiumTokens.Text
+                                ),
+                                shape = RoundedCornerShape(14.dp)
                             )
                         }
                     }
@@ -509,8 +673,9 @@ fun DesktopUI() {
                 // === Start Card ===
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFD6EAF8))
+                    shape = PremiumTokens.CardShape,
+                    colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
+                    elevation = PremiumTokens.cardElevation()
                 ) {
                     Column(Modifier.padding(12.dp), horizontalAlignment = Alignment.End) {
                         Button(
@@ -530,20 +695,22 @@ fun DesktopUI() {
                                 }
                             },
                             modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = PremiumTokens.Primary,
+                                contentColor = Color.White
+                            ),
+                            elevation = PremiumTokens.buttonElevation(),
                             shape = RoundedCornerShape(12.dp)
-                        ) { Text("Start", color = Color.White) }
+                        ) { Text("Start", fontWeight = FontWeight.SemiBold) }
                     }
                 }
-
             }
         }
     }
 }
 
-
-
 /* ======================== FILTER LOGIC ============================ */
+/* (Tidak diubah sama sekali) */
 
 fun applyFilter(
     values: List<Int>,
