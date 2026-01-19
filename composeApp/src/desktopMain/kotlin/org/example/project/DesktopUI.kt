@@ -187,6 +187,9 @@ fun DataPlotSection(
     kalmanQ: Double,
     kalmanR: Double
 ) {
+    // Apple-to-apple target: berapa sampel yang "muat" di 1 layar (mirip Code 1 yang sering terlihat seperti 100 titik terakhir)
+    val N_VISIBLE = 100
+
     val vScroll = rememberScrollState()
 
     Box(modifier = Modifier.height(320.dp).verticalScroll(vScroll)) {
@@ -205,10 +208,10 @@ fun DataPlotSection(
                 for (keyVal in sortedKeys) {
                     val values = channelMap[keyVal] ?: emptyList()
 
-                    // snapshot list supaya stabil (hindari mutable list reference)
-                    val rawSnapshot = remember(values) { values.toList() }
+                    // IMPORTANT: snapshot harus dibuat dari isi list (bukan remember(values)),
+                    // supaya update in-place pada SnapshotStateList tetap kebaca dan plot ikut berubah.
+                    val rawSnapshot = values.toList()
 
-                    // ✅ filtered dihitung langsung dari rawSnapshot + parameter filter
                     val filteredValues = remember(
                         rawSnapshot, selectedFilter, sgWindow, sgOrder, kalmanQ, kalmanR
                     ) {
@@ -227,95 +230,114 @@ fun DataPlotSection(
                     key(keyVal) {
                         val hScroll = rememberScrollState()
 
-                        val points = max(rawSnapshot.size, filteredValues.size).coerceAtLeast(2)
-                        val dpPerSample = 10.dp
-                        val plotWidth = dpPerSample * points
+                        // Total points untuk panjang plot (gabungan raw vs filtered)
+                        val totalPoints = max(rawSnapshot.size, filteredValues.size).coerceAtLeast(2)
 
-                        Box(
+                        // Ambil lebar viewport (yang terlihat) supaya kita bisa bikin "fit-to-width" ala Code 1.
+                        BoxWithConstraints(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(110.dp)
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .horizontalScroll(hScroll)
-                                    .draggable(
-                                        orientation = Orientation.Horizontal,
-                                        state = rememberDraggableState { delta ->
-                                            hScroll.dispatchRawDelta(-delta)
-                                        }
-                                    )
-                            ) {
-                                Canvas(
+                            val viewportWidthDp = this.maxWidth
+
+                            // dp per sample ditentukan dari "berapa sampel per layar" (N_VISIBLE)
+                            val dpPerSample = (viewportWidthDp / (N_VISIBLE - 1).coerceAtLeast(1))
+
+                            // Panjang total plot (biar bisa scroll sepanjang data)
+                            val plotWidthDp = (dpPerSample * (totalPoints - 1))
+                                .coerceAtLeast(viewportWidthDp)
+
+                            // Auto-scroll ke kanan (data terbaru), biar perilaku lebih mirip Code 1 (yang biasanya nunjukin data terbaru)
+                            LaunchedEffect(totalPoints, plotWidthDp) {
+                                hScroll.scrollTo(hScroll.maxValue)
+                            }
+
+                            Box(modifier = Modifier.fillMaxSize()) {
+                                Box(
                                     modifier = Modifier
-                                        .width(plotWidth)
-                                        .fillMaxHeight()
-                                        .padding(bottom = 12.dp)
-                                ) {
-                                    val dataForScale =
-                                        if (filteredValues.isNotEmpty()) (rawSnapshot + filteredValues) else rawSnapshot
-
-                                    if (dataForScale.size >= 2) {
-                                        val maxVal = dataForScale.maxOrNull()?.toFloat() ?: 100f
-                                        val minVal = dataForScale.minOrNull()?.toFloat() ?: 0f
-                                        val rangeVal = max(1e-6f, maxVal - minVal)
-                                        val scaleY = size.height / rangeVal
-                                        val stepX = size.width / (points - 1).coerceAtLeast(1)
-
-                                        // Grid
-                                        val grid = PremiumTokens.Border.copy(alpha = 0.55f)
-                                        val numHorizontalLines = 5
-                                        repeat(numHorizontalLines) {
-                                            val y = it * (size.height / (numHorizontalLines - 1))
-                                            drawLine(grid, Offset(0f, y), Offset(size.width, y), 1f)
-                                        }
-                                        val numVerticalLines = 12
-                                        val stepXGrid = size.width / (numVerticalLines - 1).coerceAtLeast(1)
-                                        repeat(numVerticalLines) {
-                                            val x = it * stepXGrid
-                                            drawLine(grid, Offset(x, 0f), Offset(x, size.height), 1f)
-                                        }
-
-                                        // Raw
-                                        if (rawSnapshot.size >= 2) {
-                                            for (i in 0 until rawSnapshot.size - 1) {
-                                                val y1 = size.height - ((rawSnapshot[i].toFloat() - minVal) * scaleY)
-                                                val y2 = size.height - ((rawSnapshot[i + 1].toFloat() - minVal) * scaleY)
-                                                drawLine(
-                                                    PremiumTokens.Accent,
-                                                    Offset(i * stepX, y1),
-                                                    Offset((i + 1) * stepX, y2),
-                                                    2f
-                                                )
+                                        .fillMaxSize()
+                                        .horizontalScroll(hScroll)
+                                        .draggable(
+                                            orientation = Orientation.Horizontal,
+                                            state = rememberDraggableState { delta ->
+                                                hScroll.dispatchRawDelta(-delta)
                                             }
-                                        }
+                                        )
+                                ) {
+                                    Canvas(
+                                        modifier = Modifier
+                                            .width(plotWidthDp)
+                                            .fillMaxHeight()
+                                            .padding(bottom = 12.dp)
+                                    ) {
+                                        // X scaling (apple-to-apple): stepX berbasis "samples-per-screen", bukan 10.dp fixed
+                                        val stepX = dpPerSample.toPx()
 
-                                        // Filtered
-                                        if (filteredValues.size >= 2) {
-                                            val gold = Color(0xFFF59E0B)
-                                            for (i in 0 until filteredValues.size - 1) {
-                                                val y1 = size.height - ((filteredValues[i].toFloat() - minVal) * scaleY)
-                                                val y2 = size.height - ((filteredValues[i + 1].toFloat() - minVal) * scaleY)
-                                                drawLine(
-                                                    gold,
-                                                    Offset(i * stepX, y1),
-                                                    Offset((i + 1) * stepX, y2),
-                                                    2f
-                                                )
+                                        // Y scaling: pakai range (benar) dan share untuk raw+filtered
+                                        val dataForScale =
+                                            if (filteredValues.isNotEmpty()) (rawSnapshot + filteredValues) else rawSnapshot
+
+                                        if (dataForScale.size >= 2) {
+                                            val maxVal = dataForScale.maxOrNull()?.toFloat() ?: 100f
+                                            val minVal = dataForScale.minOrNull()?.toFloat() ?: 0f
+                                            val rangeVal = max(1e-6f, maxVal - minVal)
+                                            val scaleY = size.height / rangeVal
+
+                                            // Grid
+                                            val grid = PremiumTokens.Border.copy(alpha = 0.55f)
+                                            val numHorizontalLines = 5
+                                            repeat(numHorizontalLines) {
+                                                val y = it * (size.height / (numHorizontalLines - 1))
+                                                drawLine(grid, Offset(0f, y), Offset(size.width, y), 1f)
+                                            }
+                                            val numVerticalLines = 12
+                                            val stepXGrid = size.width / (numVerticalLines - 1).coerceAtLeast(1)
+                                            repeat(numVerticalLines) {
+                                                val x = it * stepXGrid
+                                                drawLine(grid, Offset(x, 0f), Offset(x, size.height), 1f)
+                                            }
+
+                                            // Raw line
+                                            if (rawSnapshot.size >= 2) {
+                                                for (i in 0 until rawSnapshot.size - 1) {
+                                                    val y1 = size.height - ((rawSnapshot[i].toFloat() - minVal) * scaleY)
+                                                    val y2 = size.height - ((rawSnapshot[i + 1].toFloat() - minVal) * scaleY)
+                                                    drawLine(
+                                                        PremiumTokens.Accent,
+                                                        Offset(i * stepX, y1),
+                                                        Offset((i + 1) * stepX, y2),
+                                                        2f
+                                                    )
+                                                }
+                                            }
+
+                                            // Filtered line
+                                            if (filteredValues.size >= 2) {
+                                                val gold = Color(0xFFF59E0B)
+                                                for (i in 0 until filteredValues.size - 1) {
+                                                    val y1 = size.height - ((filteredValues[i].toFloat() - minVal) * scaleY)
+                                                    val y2 = size.height - ((filteredValues[i + 1].toFloat() - minVal) * scaleY)
+                                                    drawLine(
+                                                        gold,
+                                                        Offset(i * stepX, y1),
+                                                        Offset((i + 1) * stepX, y2),
+                                                        2f
+                                                    )
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
 
-                            HorizontalScrollbar(
-                                adapter = rememberScrollbarAdapter(hScroll),
-                                modifier = Modifier
-                                    .align(Alignment.BottomCenter)
-                                    .fillMaxWidth()
-                                    .height(8.dp)
-                            )
+                                HorizontalScrollbar(
+                                    adapter = rememberScrollbarAdapter(hScroll),
+                                    modifier = Modifier
+                                        .align(Alignment.BottomCenter)
+                                        .fillMaxWidth()
+                                        .height(8.dp)
+                                )
+                            }
                         }
                     }
                 }
@@ -323,6 +345,7 @@ fun DataPlotSection(
         }
     }
 }
+
 
 
 /* ======================== MAIN UI ============================ */
@@ -384,34 +407,56 @@ fun DesktopUI() {
         derivedStateOf { latestRep?.let { fringeCountByRep[it] } ?: 0 }
     }
 
+    var droppedFirstSampleRep1 by remember { mutableStateOf(false) }
 
 
     LaunchedEffect(Unit) {
+
         MQTTClient.onMessageReceived = { message ->
             coroutineScope.launch(Dispatchers.Main) {
-                if (!message.contains("Mode:") && !message.contains("START")) {
-                    message.lines().forEach { line ->
-                        val parts = line.split(":")
-                        val channel = parts.getOrNull(0)?.toIntOrNull()
-                        val value = parts.getOrNull(1)?.toIntOrNull()
-                        if (channel != null && value != null) {
-                            val list = channelMap.getOrPut(channel) { mutableStateListOf() }
-                            list.add(value)
-                            if (list.size > 2000) list.removeFirst()
 
-                            val filtered = applyFilter(
-                                list, selectedFilter, sgWindow, sgOrder,
-                                kalmanQ.toDouble(), kalmanR.toDouble()
-                            )
+                val isControlMessage = message.contains("Mode:") && message.contains("START")
+                if (isControlMessage) return@launch
 
-                            filteredMap[channel] = filtered.toMutableList()
-                            showPlot = true
+                message.lines().forEach { line ->
+                    val parts = line.split(":")
+                    val channel = parts.getOrNull(0)?.toIntOrNull()
+                    val value = parts.getOrNull(1)?.toIntOrNull()
+
+                    if (channel != null && value != null) {
+
+                        sensorMessagesList.add(line)
+                        if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+
+                        if (channel == 1 && !droppedFirstSampleRep1) {
+                            droppedFirstSampleRep1 = true
+                            return@forEach
                         }
+
+                        val list = channelMap.getOrPut(channel) { mutableStateListOf() }
+                        list.add(value)
+                        if (list.size > 2000) list.removeFirst()
+
+                        val filtered = applyFilter(
+                            list.toList(),
+                            selectedFilter,
+                            sgWindow,
+                            sgOrder,
+                            kalmanQ.toDouble(),
+                            kalmanR.toDouble()
+                        )
+                        filteredMap[channel] = filtered.toMutableList()
+
+                        showPlot = true
                     }
                 }
             }
         }
     }
+
+
+
+
 
     Column(
         modifier = Modifier
@@ -888,6 +933,7 @@ fun DesktopUI() {
                                     } else if (connected) {
                                         channelMap.clear()
                                         filteredMap.clear()
+                                        droppedFirstSampleRep1 = false
                                         showPlot = true
                                         val cmd =
                                             "Mode:$mode;${if (mode == "Rotasi") "Angle" else "Distance"}:$angle;" +
