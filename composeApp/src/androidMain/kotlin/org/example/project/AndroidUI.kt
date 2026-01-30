@@ -505,7 +505,7 @@ fun NavigationOverlayPagePremium(
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = PremiumTokens.CardShape,
-                colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
+                colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),    
                 elevation = PremiumTokens.cardElevation()
             ) {
                 Column(Modifier.padding(12.dp)) {
