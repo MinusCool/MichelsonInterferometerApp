@@ -1,5 +1,6 @@
 package org.example.project
 
+import android.util.Log
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -26,6 +27,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -36,11 +38,151 @@ import interferometerapp.composeapp.generated.resources.Res
 import interferometerapp.composeapp.generated.resources.interferometer_header
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
+import org.eclipse.paho.client.mqttv3.MqttCallback
+import org.eclipse.paho.client.mqttv3.MqttClient
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions
+import org.eclipse.paho.client.mqttv3.MqttException
+import org.eclipse.paho.client.mqttv3.MqttMessage
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import org.jetbrains.compose.resources.painterResource
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.pow
 import kotlin.math.roundToInt
+
+/* ======================== LOGCAT HELPERS ============================ */
+
+private const val TAG_MQTT_TX = "MQTT-TX"
+private const val TAG_MQTT_RX = "MQTT-RX"
+private const val TAG_APP = "APP"
+
+// Topics dipisah (COMMAND vs DATA)
+private const val TOPIC_COMMAND = "motor/commands"
+private const val TOPIC_DATA = "motor/data"
+
+private fun logLong(tag: String, message: String, priority: Int = Log.INFO) {
+    val chunkSize = 3500
+    if (message.length <= chunkSize) {
+        when (priority) {
+            Log.DEBUG -> Log.d(tag, message)
+            Log.WARN -> Log.w(tag, message)
+            Log.ERROR -> Log.e(tag, message)
+            else -> Log.i(tag, message)
+        }
+        return
+    }
+
+    var start = 0
+    var part = 1
+    while (start < message.length) {
+        val end = (start + chunkSize).coerceAtMost(message.length)
+        val chunk = "" + message.substring(start, end)
+        when (priority) {
+            Log.DEBUG -> Log.d(tag, chunk)
+            Log.WARN -> Log.w(tag, chunk)
+            Log.ERROR -> Log.e(tag, chunk)
+            else -> Log.i(tag, chunk)
+        }
+        start = end
+        part++
+    }
+}
+
+/* ======================== DATA MQTT CLIENT (SUBSCRIBE motor/data) ============================ */
+
+private class DataMqttClient(
+    private val onDataMessage: (String) -> Unit
+) {
+    private val persistence = MemoryPersistence()
+    private var client: MqttClient? = null
+
+    fun connect() {
+        try {
+            // clientId harus beda dari MQTTConfig.clientId supaya broker tidak “kick” koneksi lain
+            val dataClientId = MQTTConfig.clientId + "_DATA"
+            client = MqttClient(MQTTConfig.broker, dataClientId, persistence)
+
+            val connOpts = MqttConnectOptions().apply {
+                isCleanSession = true
+                userName = MQTTConfig.username
+                password = MQTTConfig.password.toCharArray()
+            }
+
+            client?.setCallback(object : MqttCallback {
+                override fun connectionLost(cause: Throwable?) {
+                    Log.e(TAG_APP, "DATA MQTT connection lost: ${cause?.message}")
+                }
+
+                override fun messageArrived(topic: String?, message: MqttMessage?) {
+                    val received = message?.toString() ?: ""
+
+                    // ====== REVISI: log menyebut repetisi (angka sebelum ":"), tanpa mengubah alur/fungsi ======
+                    val isControlMessage = received.contains("Mode:") && received.contains("START")
+                    if (!isControlMessage) {
+                        // Ambil repetisi pertama yang valid dari payload (format "1:....")
+                        val rep = received
+                            .lineSequence()
+                            .mapNotNull { line ->
+                                val idx = line.indexOf(':')
+                                if (idx <= 0) null else line.substring(0, idx).trim().toIntOrNull()
+                            }
+                            .firstOrNull()
+
+                        if (rep != null) {
+                            logLong(
+                                TAG_MQTT_RX,
+                                "Transmisi data repetisi ke-$rep berhasil (app menerima dari ESP32). topic=$topic.",
+                                Log.INFO
+                            )
+                        } else {
+                            // fallback bila payload tidak sesuai format data
+                            logLong(
+                                TAG_MQTT_RX,
+                                "Transmisi data berhasil (app menerima dari ESP32). topic=$topic ",
+                                Log.INFO
+                            )
+                        }
+                    } else {
+                        // control message: biarkan seperti sebelumnya (atau tetap log umum)
+                        logLong(
+                            TAG_MQTT_RX,
+                            "Transmisi data berhasil (app menerima dari ESP32). topic=$topic ",
+                            Log.INFO
+                        )
+                    }
+                    // ====== end revisi ======
+
+                    onDataMessage(received)
+                }
+
+                override fun deliveryComplete(token: IMqttDeliveryToken?) {
+                    // no-op
+                }
+            })
+
+            Log.i(TAG_APP, "Connecting DATA client to broker: ${MQTTConfig.broker}")
+            client?.connect(connOpts)
+
+            // Subscribe khusus data
+            client?.subscribe(TOPIC_DATA)
+            Log.i(TAG_APP, "DATA client connected and subscribed to $TOPIC_DATA")
+        } catch (e: MqttException) {
+            Log.e(TAG_APP, "DATA client connect error: ${e.message}", e)
+        }
+    }
+
+    fun disconnect() {
+        try {
+            client?.disconnect()
+            Log.i(TAG_APP, "DATA client disconnected")
+        } catch (e: MqttException) {
+            Log.e(TAG_APP, "DATA client disconnect error: ${e.message}", e)
+        } finally {
+            client = null
+        }
+    }
+}
 
 /* ======================== PREMIUM UI TOKENS (SAMA SEPERTI DESKTOP) ============================ */
 
@@ -105,7 +247,9 @@ fun AndroidUI() {
         val coroutineScope = rememberCoroutineScope()
         val keyboardController = LocalSoftwareKeyboardController.current
 
+        // (tidak dipakai, tapi kamu minta keep)
         var receivedMessage by remember { mutableStateOf("") } // keep
+
         val channelMap = remember { mutableStateMapOf<Int, MutableList<Int>>() } // keep type
         var showNavigationPopup by remember { mutableStateOf(false) }
 
@@ -132,34 +276,57 @@ fun AndroidUI() {
         val sensorMessages = remember { mutableStateListOf<String>() }
         var droppedFirstSampleRep1 by remember { mutableStateOf(false) } // sama seperti desktop
 
-        // MQTT parsing: sama konsep desktop (update di Main)
+        // DATA client (subscribe motor/data) — dibuat sekali
+        val dataClient = remember {
+            DataMqttClient { message ->
+                // Parse data persis seperti sebelumnya
+                val isControlMessage = message.contains("Mode:") && message.contains("START")
+                if (isControlMessage) return@DataMqttClient
+
+                message.lines().forEach { line ->
+                    val parts = line.split(":")
+                    val channel = parts.getOrNull(0)?.toIntOrNull()
+                    val value = parts.getOrNull(1)?.toIntOrNull()
+                    if (channel != null && value != null) {
+                        sensorMessages.add(line)
+
+                        if (channel == 1 && !droppedFirstSampleRep1) {
+                            droppedFirstSampleRep1 = true
+                            return@forEach
+                        }
+
+                        val list = channelMap.getOrPut(channel) { mutableStateListOf() }
+                        list.add(value)
+                        if (list.size > 2000) list.removeFirst()
+                    }
+                }
+            }
+        }
+
+        // MQTTClient bawaan kamu tetap dipakai untuk command
         LaunchedEffect(Unit) {
+            Log.i(TAG_APP, "AndroidUI started. Setting MQTTClient.onMessageReceived callback.")
+
+            // warning jika topic config tidak sesuai split-topic (tidak mengubah apapun, hanya log)
+            runCatching {
+                if (MQTTConfig.topic != TOPIC_COMMAND) {
+                    Log.w(
+                        TAG_APP,
+                        "MQTTConfig.topic='${MQTTConfig.topic}' != '$TOPIC_COMMAND'. " +
+                                "Agar command/data benar-benar terpisah topic, set MQTTConfig.topic ke '$TOPIC_COMMAND'."
+                    )
+                }
+            }
+
             MQTTClient.onMessageReceived = { message ->
                 coroutineScope.launch(Dispatchers.Main) {
-                    val isControlMessage = message.contains("Mode:") && message.contains("START")
-                    if (isControlMessage) return@launch
-
-                    message.lines().forEach { line ->
-                        val parts = line.split(":")
-                        val channel = parts.getOrNull(0)?.toIntOrNull()
-                        val value = parts.getOrNull(1)?.toIntOrNull()
-                        if (channel != null && value != null) {
-
-                            // tampilkan SEMUA (tidak dipotong window); scroll yang menangani
-                            sensorMessages.add(line)
-
-                            // drop first sample rep1 (persis desktop)
-                            if (channel == 1 && !droppedFirstSampleRep1) {
-                                droppedFirstSampleRep1 = true
-                                return@forEach
-                            }
-
-                            // simpan SEMUA sampel per repetition (persis desktop: cap besar 2000)
-                            val list = channelMap.getOrPut(channel) { mutableStateListOf() }
-                            list.add(value)
-                            if (list.size > 2000) list.removeFirst()
-                        }
-                    }
+                    // Ini biasanya echo/control dari topic command
+                    logLong(
+                        TAG_MQTT_RX,
+                        "RX (via MQTTClient topic=${runCatching { MQTTConfig.topic }.getOrDefault("?")}):\n$message",
+                        Log.INFO
+                    )
+                    // Tidak parse supaya behavior lama aman (data sekarang dari motor/data)
                 }
             }
         }
@@ -171,7 +338,6 @@ fun AndroidUI() {
         ) {
             HeaderWithMicroscope()
 
-            // sheet overlap sedikit ke header (offset negatif)
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -191,7 +357,6 @@ fun AndroidUI() {
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                     horizontalAlignment = Alignment.Start
                 ) {
-                    // ===== MQTT Messages Card (scroll untuk lihat semua) =====
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         shape = PremiumTokens.CardShape,
@@ -231,7 +396,6 @@ fun AndroidUI() {
                         }
                     }
 
-                    // ===== Data Visualization Card (button) =====
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         shape = PremiumTokens.CardShape,
@@ -255,7 +419,6 @@ fun AndroidUI() {
                         }
                     }
 
-                    // ===== Status Card =====
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         shape = PremiumTokens.CardShape,
@@ -268,21 +431,33 @@ fun AndroidUI() {
                                 coroutineScope.launch {
                                     val newConnected = status != "Connected"
                                     if (newConnected) {
+                                        Log.i(TAG_APP, "Connect requested from UI.")
+
+                                        // connect command client (MQTTClient)
                                         MQTTClient.connect()
+
+                                        // connect data client (motor/data) di IO
+                                        launch(Dispatchers.IO) { dataClient.connect() }
+
                                         status = "Connected"
+                                        Log.i(TAG_APP, "Status set to Connected (UI-side).")
                                     } else {
+                                        Log.i(TAG_APP, "Disconnect requested from UI.")
+
                                         MQTTClient.disconnect()
+                                        launch(Dispatchers.IO) { dataClient.disconnect() }
+
                                         angleOrDistance = ""
                                         speed = ""
                                         repetitions = ""
                                         status = "Disconnected"
+                                        Log.i(TAG_APP, "Status set to Disconnected (UI-side).")
                                     }
                                 }
                             }
                         }
                     }
 
-                    // ===== Mode Card =====
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         shape = PremiumTokens.CardShape,
@@ -300,7 +475,6 @@ fun AndroidUI() {
                         }
                     }
 
-                    // ===== Settings + START Card =====
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         shape = PremiumTokens.CardShape,
@@ -408,6 +582,14 @@ fun AndroidUI() {
                                             append("Repetitions:$repetitions;")
                                             append("START")
                                         }
+
+                                        logLong(
+                                            TAG_MQTT_TX,
+                                            "Transmisi data berhasil (app mengirim). topic=${runCatching { MQTTConfig.topic }.getOrDefault("?")}",
+                                            Log.INFO
+                                        )
+
+                                        // Publish pakai MQTTClient existing (topic = MQTTConfig.topic)
                                         MQTTClient.publish(dataMessage)
                                     }
                                 },
@@ -501,11 +683,10 @@ fun NavigationOverlayPagePremium(
                 .verticalScroll(rootScroll),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // ===== Data Visualization Card (plot ada di card yang sama; VERTICAL SCROLL untuk semua repetition) =====
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = PremiumTokens.CardShape,
-                colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),    
+                colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
                 elevation = PremiumTokens.cardElevation()
             ) {
                 Column(Modifier.padding(12.dp)) {
@@ -516,7 +697,7 @@ fun NavigationOverlayPagePremium(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(320.dp) // ~2 plot terlihat, sisanya scroll
+                            .height(320.dp)
                             .verticalScroll(plotScroll)
                     ) {
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -545,7 +726,6 @@ fun NavigationOverlayPagePremium(
                 }
             }
 
-            // ===== Filter Settings + Fringe list =====
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = PremiumTokens.CardShape,
@@ -738,7 +918,6 @@ fun NavigationOverlayPagePremium(
             }
         }
 
-        // Fixed Back button
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -833,7 +1012,6 @@ private fun PlotCardPerRepetition(
                             val rangeVal = max(1e-6f, maxVal - minVal)
                             val scaleY = size.height / rangeVal
 
-                            // Grid
                             val grid = PremiumTokens.Border.copy(alpha = 0.55f)
                             val numHorizontalLines = 5
                             repeat(numHorizontalLines) {
@@ -847,7 +1025,6 @@ private fun PlotCardPerRepetition(
                                 drawLine(grid, Offset(x, 0f), Offset(x, size.height), 1f)
                             }
 
-                            // Raw line
                             if (rawSnapshot.size >= 2) {
                                 for (i in 0 until rawSnapshot.size - 1) {
                                     val y1 = size.height - ((rawSnapshot[i].toFloat() - minVal) * scaleY)
@@ -861,7 +1038,6 @@ private fun PlotCardPerRepetition(
                                 }
                             }
 
-                            // Filtered line
                             if (filteredSnapshot.size >= 2) {
                                 val gold = Color(0xFFF59E0B)
                                 for (i in 0 until filteredSnapshot.size - 1) {

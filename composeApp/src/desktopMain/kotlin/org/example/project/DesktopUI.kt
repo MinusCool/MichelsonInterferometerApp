@@ -187,7 +187,6 @@ fun DataPlotSection(
     kalmanQ: Double,
     kalmanR: Double
 ) {
-    // Apple-to-apple target: berapa sampel yang "muat" di 1 layar (mirip Code 1 yang sering terlihat seperti 100 titik terakhir)
     val N_VISIBLE = 100
 
     val vScroll = rememberScrollState()
@@ -207,9 +206,6 @@ fun DataPlotSection(
             } else {
                 for (keyVal in sortedKeys) {
                     val values = channelMap[keyVal] ?: emptyList()
-
-                    // IMPORTANT: snapshot harus dibuat dari isi list (bukan remember(values)),
-                    // supaya update in-place pada SnapshotStateList tetap kebaca dan plot ikut berubah.
                     val rawSnapshot = values.toList()
 
                     val filteredValues = remember(
@@ -230,10 +226,8 @@ fun DataPlotSection(
                     key(keyVal) {
                         val hScroll = rememberScrollState()
 
-                        // Total points untuk panjang plot (gabungan raw vs filtered)
                         val totalPoints = max(rawSnapshot.size, filteredValues.size).coerceAtLeast(2)
 
-                        // Ambil lebar viewport (yang terlihat) supaya kita bisa bikin "fit-to-width" ala Code 1.
                         BoxWithConstraints(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -241,14 +235,10 @@ fun DataPlotSection(
                         ) {
                             val viewportWidthDp = this.maxWidth
 
-                            // dp per sample ditentukan dari "berapa sampel per layar" (N_VISIBLE)
                             val dpPerSample = (viewportWidthDp / (N_VISIBLE - 1).coerceAtLeast(1))
-
-                            // Panjang total plot (biar bisa scroll sepanjang data)
                             val plotWidthDp = (dpPerSample * (totalPoints - 1))
                                 .coerceAtLeast(viewportWidthDp)
 
-                            // Auto-scroll ke kanan (data terbaru), biar perilaku lebih mirip Code 1 (yang biasanya nunjukin data terbaru)
                             LaunchedEffect(totalPoints, plotWidthDp) {
                                 hScroll.scrollTo(hScroll.maxValue)
                             }
@@ -271,10 +261,8 @@ fun DataPlotSection(
                                             .fillMaxHeight()
                                             .padding(bottom = 12.dp)
                                     ) {
-                                        // X scaling (apple-to-apple): stepX berbasis "samples-per-screen", bukan 10.dp fixed
                                         val stepX = dpPerSample.toPx()
 
-                                        // Y scaling: pakai range (benar) dan share untuk raw+filtered
                                         val dataForScale =
                                             if (filteredValues.isNotEmpty()) (rawSnapshot + filteredValues) else rawSnapshot
 
@@ -284,7 +272,6 @@ fun DataPlotSection(
                                             val rangeVal = max(1e-6f, maxVal - minVal)
                                             val scaleY = size.height / rangeVal
 
-                                            // Grid
                                             val grid = PremiumTokens.Border.copy(alpha = 0.55f)
                                             val numHorizontalLines = 5
                                             repeat(numHorizontalLines) {
@@ -298,7 +285,6 @@ fun DataPlotSection(
                                                 drawLine(grid, Offset(x, 0f), Offset(x, size.height), 1f)
                                             }
 
-                                            // Raw line
                                             if (rawSnapshot.size >= 2) {
                                                 for (i in 0 until rawSnapshot.size - 1) {
                                                     val y1 = size.height - ((rawSnapshot[i].toFloat() - minVal) * scaleY)
@@ -312,7 +298,6 @@ fun DataPlotSection(
                                                 }
                                             }
 
-                                            // Filtered line
                                             if (filteredValues.size >= 2) {
                                                 val gold = Color(0xFFF59E0B)
                                                 for (i in 0 until filteredValues.size - 1) {
@@ -346,7 +331,53 @@ fun DataPlotSection(
     }
 }
 
+/* ======================== CSV HELPERS (ADDED) ============================ */
 
+private fun experimentsDir(): File {
+    val dir = File("experiments")
+    if (!dir.exists()) dir.mkdirs()
+    return dir
+}
+
+private fun nextExperimentNumber(): Int {
+    val dir = experimentsDir()
+    val files = dir.listFiles() ?: return 1
+    val regex = Regex("""percobaan_(\d+)\.csv""")
+    var maxN = 0
+    for (f in files) {
+        val m = regex.matchEntire(f.name) ?: continue
+        val n = m.groupValues[1].toIntOrNull() ?: continue
+        if (n > maxN) maxN = n
+    }
+    return maxN + 1
+}
+
+private fun writeExperimentCsv(
+    experimentNo: Int,
+    channelMapSnap: Map<Int, List<Int>>,
+    filteredMapSnap: Map<Int, List<Int>>
+): File {
+    val dir = experimentsDir()
+    val outFile = File(dir, "percobaan_${experimentNo}.csv")
+
+    outFile.bufferedWriter().use { w ->
+        w.appendLine("experiment,repetition,sampleIndex,raw,filtered")
+        val reps = channelMapSnap.keys.sorted()
+        for (rep in reps) {
+            val raw = channelMapSnap[rep].orEmpty()
+            val filt = filteredMapSnap[rep].orEmpty()
+            val n = max(raw.size, filt.size)
+            for (i in 0 until n) {
+                val rv = raw.getOrNull(i)
+                val fv = filt.getOrNull(i)
+                val rvStr = rv?.toString() ?: ""
+                val fvStr = fv?.toString() ?: ""
+                w.appendLine("$experimentNo,$rep,$i,$rvStr,$fvStr")
+            }
+        }
+    }
+    return outFile
+}
 
 /* ======================== MAIN UI ============================ */
 
@@ -364,7 +395,6 @@ fun DesktopUI() {
     var filteredMap by remember { mutableStateOf<MutableMap<Int, MutableList<Int>>>(mutableStateMapOf()) }
     var showAlertDialog by remember { mutableStateOf(false) }
 
-    // Filter states
     var selectedFilter by remember { mutableStateOf("SG") }
     var sgWindow by remember { mutableStateOf(7) }
     var sgOrder by remember { mutableStateOf(2) }
@@ -374,8 +404,11 @@ fun DesktopUI() {
     val filters = listOf("SG", "Kalman")
     val coroutineScope = rememberCoroutineScope()
 
-    // ===== Fringe Count PER repetition (ambil dari filteredMap) =====
-    // ===== Fringe Count ADAPTIF: dihitung dari FILTERED values (per repetition) =====
+    // ===== ADDED: experiment tracking =====
+    var currentExperimentNo by remember { mutableStateOf<Int?>(null) }
+    var awaitingDoneToSave by remember { mutableStateOf(false) }
+    var lastSavedCsvName by remember { mutableStateOf<String?>(null) }
+
     val filteredSeriesByRep by remember {
         derivedStateOf {
             channelMap.keys.sorted().associateWith { rep ->
@@ -409,11 +442,35 @@ fun DesktopUI() {
 
     var droppedFirstSampleRep1 by remember { mutableStateOf(false) }
 
-
     LaunchedEffect(Unit) {
 
         MQTTClient.onMessageReceived = { message ->
             coroutineScope.launch(Dispatchers.Main) {
+
+                val msgTrim = message.trim()
+
+                // ===== ADDED: DONE handler =====
+                if (msgTrim == "DONE") {
+                    val expNo = currentExperimentNo
+                    if (awaitingDoneToSave && expNo != null) {
+                        val channelSnap: Map<Int, List<Int>> =
+                            channelMap.mapValues { it.value.toList() }.toMap()
+                        val filteredSnap: Map<Int, List<Int>> =
+                            filteredMap.mapValues { it.value.toList() }.toMap()
+
+                        awaitingDoneToSave = false
+
+                        coroutineScope.launch(Dispatchers.IO) {
+                            val f = writeExperimentCsv(expNo, channelSnap, filteredSnap)
+                            launch(Dispatchers.Main) {
+                                lastSavedCsvName = f.name
+                                sensorMessagesList.add("Saved CSV: ${f.name}")
+                                if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+                            }
+                        }
+                    }
+                    return@launch
+                }
 
                 val isControlMessage = message.contains("Mode:") && message.contains("START")
                 if (isControlMessage) return@launch
@@ -454,10 +511,6 @@ fun DesktopUI() {
         }
     }
 
-
-
-
-
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -465,7 +518,6 @@ fun DesktopUI() {
     ) {
         HeaderSection(painterResource("interferometer_header.png"))
 
-        // ✅ Box ini yang mengisi sisa tinggi, agar sheet putih full sampai bawah & bounded
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -551,6 +603,16 @@ fun DesktopUI() {
                                     ModeSelectionChipGroup(mode) { newMode -> mode = newMode }
                                 }
                             }
+
+//                            if (lastSavedCsvName != null) {
+//                                Spacer(Modifier.height(12.dp))
+//                                Text(
+//                                    "Last saved: $lastSavedCsvName",
+//                                    color = PremiumTokens.TextMuted,
+//                                    fontSize = 12.sp,
+//                                    fontWeight = FontWeight.Medium
+//                                )
+//                            }
                         }
 
                         Row(modifier = Modifier.weight(2f), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -591,7 +653,6 @@ fun DesktopUI() {
                             }
                         }
 
-                        /* =============== Filter Settings Card =============== */
                         Card(
                             modifier = Modifier
                                 .weight(1f)
@@ -709,7 +770,6 @@ fun DesktopUI() {
                                     }
                                 }
 
-                                // ===== Fringe Count component (per repetition) =====
                                 Spacer(Modifier.height(12.dp))
                                 Divider(color = PremiumTokens.Border.copy(alpha = 0.85f))
                                 Spacer(Modifier.height(10.dp))
@@ -751,17 +811,15 @@ fun DesktopUI() {
                                         fontSize = 12.sp
                                     )
                                 } else {
-                                    // Container yang punya scroll + scrollbar
                                     Box(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .heightIn(min = 80.dp, max = 140.dp) // tweak sesuai kebutuhan
+                                            .heightIn(min = 80.dp, max = 140.dp)
                                     ) {
-                                        // Area konten yang di-scroll
                                         Box(
                                             modifier = Modifier
                                                 .fillMaxSize()
-                                                .padding(end = 10.dp) // space biar tidak ketutup scrollbar
+                                                .padding(end = 10.dp)
                                                 .verticalScroll(listScroll)
                                         ) {
                                             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -795,7 +853,6 @@ fun DesktopUI() {
                                             }
                                         }
 
-                                        // Scrollbar Desktop
                                         VerticalScrollbar(
                                             adapter = rememberScrollbarAdapter(listScroll),
                                             modifier = Modifier
@@ -808,8 +865,6 @@ fun DesktopUI() {
                             }
                         }
                     }
-
-                    /* =============== Settings & Start Cards =============== */
 
                     if (showAlertDialog) {
                         AlertDialog(
@@ -931,6 +986,12 @@ fun DesktopUI() {
                                     ) {
                                         showAlertDialog = true
                                     } else if (connected) {
+                                        // ===== ADDED: allocate new experiment number on Start =====
+                                        val expNo = nextExperimentNumber()
+                                        currentExperimentNo = expNo
+                                        awaitingDoneToSave = true
+                                        lastSavedCsvName = null
+
                                         channelMap.clear()
                                         filteredMap.clear()
                                         droppedFirstSampleRep1 = false
@@ -961,7 +1022,8 @@ fun DesktopUI() {
 /* Peak-to-peak: peak1=0, peak2=1 => fringe = peaks - 1 */
 
 private fun countFringesFromPeaks(values: List<Int>): Int {
-    val peaks = detectPeaks(values)
+    val normalized = normalizeByEnvelopesOptionA(values)
+    val peaks = detectPeaks(normalized)
     return (peaks.size - 1).coerceAtLeast(0)
 }
 
@@ -973,12 +1035,8 @@ private fun detectPeaks(values: List<Int>): List<Int> {
     val range = (maxV - minV).toDouble()
     if (range < 1e-9) return emptyList()
 
-    // Untuk sinus halus, cara paling stabil:
-    // - local maxima
-    // - puncak harus berada di "bagian atas" amplitude (threshold)
-    // - minimal distance antar puncak untuk hindari double count karena noise
     val minPeakDistance = 6
-    val peakThreshold = minV + (0.70 * range)   // top 30% amplitude
+    val peakThreshold = minV + (0.70 * range)
 
     val peaks = ArrayList<Int>()
     var lastPeak = -10_000
@@ -1002,6 +1060,130 @@ private fun detectPeaks(values: List<Int>): List<Int> {
     return peaks
 }
 
+/* ======================== NORMALIZATION (Option A + Guard) ============================ */
+
+private fun normalizeByEnvelopesOptionA(values: List<Int>): List<Int> {
+    if (values.isEmpty()) return values
+    if (values.size < 3) {
+        return minMaxNormalizeTo1000(values)
+    }
+
+    val peaks = findLocalMaxima(values)
+    val valleys = findLocalMinima(values)
+
+    if (peaks.size < 2 || valleys.size < 2) {
+        return minMaxNormalizeTo1000(values)
+    }
+
+    val upper = buildEnvelope(values.size, peaks)
+    val lower = buildEnvelope(values.size, valleys)
+
+    val eps = 1e-9
+    val out = IntArray(values.size)
+    for (i in values.indices) {
+        val u = upper[i]
+        val l = lower[i]
+        val denom = u - l
+        val y = if (abs(denom) < eps) 0.5 else ((values[i].toDouble() - l) / denom).coerceIn(0.0, 1.0)
+        out[i] = (y * 1000.0).roundToInt().coerceIn(0, 1000)
+    }
+    return out.toList()
+}
+
+private fun minMaxNormalizeTo1000(values: List<Int>): List<Int> {
+    val minV = values.minOrNull() ?: return values
+    val maxV = values.maxOrNull() ?: return values
+    val range = (maxV - minV).toDouble()
+    if (range < 1e-9) {
+        return List(values.size) { 500 }
+    }
+    return values.map { v ->
+        val y = ((v - minV) / range).coerceIn(0.0, 1.0)
+        (y * 1000.0).roundToInt().coerceIn(0, 1000)
+    }
+}
+
+private fun findLocalMaxima(values: List<Int>): List<Pair<Int, Double>> {
+    val pts = ArrayList<Pair<Int, Double>>()
+    for (i in 1 until values.lastIndex) {
+        val prev = values[i - 1].toDouble()
+        val curr = values[i].toDouble()
+        val next = values[i + 1].toDouble()
+        val isMax = (curr > prev && curr >= next) || (curr >= prev && curr > next)
+        if (isMax) pts.add(i to curr)
+    }
+    if (pts.isEmpty()) return pts
+    return compressSameIndexKeepBest(pts, pickMax = true)
+}
+
+private fun findLocalMinima(values: List<Int>): List<Pair<Int, Double>> {
+    val pts = ArrayList<Pair<Int, Double>>()
+    for (i in 1 until values.lastIndex) {
+        val prev = values[i - 1].toDouble()
+        val curr = values[i].toDouble()
+        val next = values[i + 1].toDouble()
+        val isMin = (curr < prev && curr <= next) || (curr <= prev && curr < next)
+        if (isMin) pts.add(i to curr)
+    }
+    if (pts.isEmpty()) return pts
+    return compressSameIndexKeepBest(pts, pickMax = false)
+}
+
+private fun compressSameIndexKeepBest(
+    pts: List<Pair<Int, Double>>,
+    pickMax: Boolean
+): List<Pair<Int, Double>> {
+    if (pts.isEmpty()) return pts
+    val sorted = pts.sortedBy { it.first }
+    val out = ArrayList<Pair<Int, Double>>()
+    var curIdx = sorted[0].first
+    var curVal = sorted[0].second
+    for (k in 1 until sorted.size) {
+        val (idx, v) = sorted[k]
+        if (idx == curIdx) {
+            curVal = if (pickMax) max(curVal, v) else min(curVal, v)
+        } else {
+            out.add(curIdx to curVal)
+            curIdx = idx
+            curVal = v
+        }
+    }
+    out.add(curIdx to curVal)
+    return out
+}
+
+private fun buildEnvelope(n: Int, points: List<Pair<Int, Double>>): DoubleArray {
+    val env = DoubleArray(n)
+
+    val pts = points.sortedBy { it.first }
+    if (pts.isEmpty()) {
+        for (i in 0 until n) env[i] = 0.0
+        return env
+    }
+
+    val firstIdx = pts.first().first.coerceIn(0, n - 1)
+    val firstVal = pts.first().second
+    for (i in 0..firstIdx) env[i] = firstVal
+
+    for (p in 0 until pts.size - 1) {
+        val (i0, v0) = pts[p]
+        val (i1, v1) = pts[p + 1]
+        val a = i0.coerceIn(0, n - 1)
+        val b = i1.coerceIn(0, n - 1)
+        if (b <= a) continue
+        val len = (b - a).toDouble()
+        for (i in a..b) {
+            val t = (i - a) / len
+            env[i] = v0 + t * (v1 - v0)
+        }
+    }
+
+    val lastIdx = pts.last().first.coerceIn(0, n - 1)
+    val lastVal = pts.last().second
+    for (i in lastIdx until n) env[i] = lastVal
+
+    return env
+}
 
 /* ======================== FILTER LOGIC ============================ */
 
