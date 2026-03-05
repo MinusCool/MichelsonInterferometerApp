@@ -1,10 +1,17 @@
 package org.example.project
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.HorizontalScrollbar
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.rememberScrollbarAdapter
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -24,18 +31,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.*
-import androidx.compose.foundation.HorizontalScrollbar
-import androidx.compose.foundation.gestures.Orientation
-import androidx.compose.foundation.gestures.draggable
-import androidx.compose.foundation.gestures.rememberDraggableState
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.rememberScrollbarAdapter
-import androidx.compose.foundation.VerticalScrollbar
-
 import java.io.File
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.util.concurrent.atomic.AtomicLong
 
 /* ======================== PREMIUM UI TOKENS ============================ */
 
@@ -181,14 +185,9 @@ fun ModeSelectionChipGroup(mode: String, onModeChange: (String) -> Unit) {
 @Composable
 fun DataPlotSection(
     channelMap: Map<Int, List<Int>>,
-    selectedFilter: String,
-    sgWindow: Int,
-    sgOrder: Int,
-    kalmanQ: Double,
-    kalmanR: Double
+    filteredMap: Map<Int, List<Double>>
 ) {
     val N_VISIBLE = 100
-
     val vScroll = rememberScrollState()
 
     Box(modifier = Modifier.height(320.dp).verticalScroll(vScroll)) {
@@ -207,15 +206,13 @@ fun DataPlotSection(
                 for (keyVal in sortedKeys) {
                     val values = channelMap[keyVal] ?: emptyList()
                     val rawSnapshot = values.toList()
+                    val filteredSnapshot = (filteredMap[keyVal] ?: emptyList()).toList()
 
-                    val filteredValues = remember(
-                        rawSnapshot, selectedFilter, sgWindow, sgOrder, kalmanQ, kalmanR
-                    ) {
-                        if (rawSnapshot.isNotEmpty())
-                            applyFilter(rawSnapshot, selectedFilter, sgWindow, sgOrder, kalmanQ, kalmanR)
-                        else emptyList()
-                    }
-
+                    Text(
+                        "samples=${rawSnapshot.size}  min=${rawSnapshot.minOrNull()}  max=${rawSnapshot.maxOrNull()}",
+                        fontSize = 12.sp,
+                        color = PremiumTokens.TextMuted
+                    )
                     Text(
                         "Repetition $keyVal",
                         fontSize = 16.sp,
@@ -225,8 +222,7 @@ fun DataPlotSection(
 
                     key(keyVal) {
                         val hScroll = rememberScrollState()
-
-                        val totalPoints = max(rawSnapshot.size, filteredValues.size).coerceAtLeast(2)
+                        val totalPoints = max(rawSnapshot.size, filteredSnapshot.size).coerceAtLeast(2)
 
                         BoxWithConstraints(
                             modifier = Modifier
@@ -234,10 +230,8 @@ fun DataPlotSection(
                                 .height(110.dp)
                         ) {
                             val viewportWidthDp = this.maxWidth
-
                             val dpPerSample = (viewportWidthDp / (N_VISIBLE - 1).coerceAtLeast(1))
-                            val plotWidthDp = (dpPerSample * (totalPoints - 1))
-                                .coerceAtLeast(viewportWidthDp)
+                            val plotWidthDp = (dpPerSample * (totalPoints - 1)).coerceAtLeast(viewportWidthDp)
 
                             LaunchedEffect(totalPoints, plotWidthDp) {
                                 hScroll.scrollTo(hScroll.maxValue)
@@ -264,7 +258,9 @@ fun DataPlotSection(
                                         val stepX = dpPerSample.toPx()
 
                                         val dataForScale =
-                                            if (filteredValues.isNotEmpty()) (rawSnapshot + filteredValues) else rawSnapshot
+                                            if (filteredSnapshot.isNotEmpty())
+                                                (rawSnapshot.map { it.toDouble() } + filteredSnapshot)
+                                            else rawSnapshot.map { it.toDouble() }
 
                                         if (dataForScale.size >= 2) {
                                             val maxVal = dataForScale.maxOrNull()?.toFloat() ?: 100f
@@ -298,11 +294,11 @@ fun DataPlotSection(
                                                 }
                                             }
 
-                                            if (filteredValues.size >= 2) {
+                                            if (filteredSnapshot.size >= 2) {
                                                 val gold = Color(0xFFF59E0B)
-                                                for (i in 0 until filteredValues.size - 1) {
-                                                    val y1 = size.height - ((filteredValues[i].toFloat() - minVal) * scaleY)
-                                                    val y2 = size.height - ((filteredValues[i + 1].toFloat() - minVal) * scaleY)
+                                                for (i in 0 until filteredSnapshot.size - 1) {
+                                                    val y1 = size.height - ((filteredSnapshot[i].toFloat() - minVal) * scaleY)
+                                                    val y2 = size.height - ((filteredSnapshot[i + 1].toFloat() - minVal) * scaleY)
                                                     drawLine(
                                                         gold,
                                                         Offset(i * stepX, y1),
@@ -331,52 +327,231 @@ fun DataPlotSection(
     }
 }
 
-/* ======================== CSV HELPERS (ADDED) ============================ */
+/* ======================== STREAMING BUFFERS + PROCESSOR API ============================ */
 
-private fun experimentsDir(): File {
-    val dir = File("experiments")
-    if (!dir.exists()) dir.mkdirs()
-    return dir
-}
+private fun Int.floorMod(m: Int): Int = ((this % m) + m) % m
 
-private fun nextExperimentNumber(): Int {
-    val dir = experimentsDir()
-    val files = dir.listFiles() ?: return 1
-    val regex = Regex("""percobaan_(\d+)\.csv""")
-    var maxN = 0
-    for (f in files) {
-        val m = regex.matchEntire(f.name) ?: continue
-        val n = m.groupValues[1].toIntOrNull() ?: continue
-        if (n > maxN) maxN = n
-    }
-    return maxN + 1
-}
+private class IntRingBuffer(private val capacity: Int) {
+    private val data = IntArray(capacity)
+    private var head = 0
+    private var size = 0
+    private var startSeq = 0L // absolute seq number of the oldest element
 
-private fun writeExperimentCsv(
-    experimentNo: Int,
-    channelMapSnap: Map<Int, List<Int>>,
-    filteredMapSnap: Map<Int, List<Int>>
-): File {
-    val dir = experimentsDir()
-    val outFile = File(dir, "percobaan_${experimentNo}.csv")
-
-    outFile.bufferedWriter().use { w ->
-        w.appendLine("experiment,repetition,sampleIndex,raw,filtered")
-        val reps = channelMapSnap.keys.sorted()
-        for (rep in reps) {
-            val raw = channelMapSnap[rep].orEmpty()
-            val filt = filteredMapSnap[rep].orEmpty()
-            val n = max(raw.size, filt.size)
-            for (i in 0 until n) {
-                val rv = raw.getOrNull(i)
-                val fv = filt.getOrNull(i)
-                val rvStr = rv?.toString() ?: ""
-                val fvStr = fv?.toString() ?: ""
-                w.appendLine("$experimentNo,$rep,$i,$rvStr,$fvStr")
-            }
+    fun append(v: Int) {
+        data[head] = v
+        head = (head + 1) % capacity
+        if (size < capacity) {
+            size++
+        } else {
+            startSeq++ // overwrite oldest
         }
     }
+
+    fun oldestSeq(): Long = startSeq
+    fun newestSeqExclusive(): Long = startSeq + size
+    fun currentSize(): Int = size
+
+    private fun getBySeq(seq: Long): Int {
+        val idx = (seq - startSeq).toInt()
+        require(idx in 0 until size) { "seq out of range" }
+        val physical = (head - size + idx).floorMod(capacity)
+        return data[physical]
+    }
+
+    fun readChunk(fromSeq: Long, maxCount: Int): IntArray {
+        val from = max(fromSeq, oldestSeq())
+        val to = min(from + maxCount, newestSeqExclusive())
+        val n = (to - from).toInt().coerceAtLeast(0)
+        val out = IntArray(n)
+        for (i in 0 until n) out[i] = getBySeq(from + i)
+        return out
+    }
+
+    fun snapshotLast(maxPoints: Int): List<Int> {
+        val n = min(size, maxPoints)
+        val start = newestSeqExclusive() - n
+        return List(n) { i -> getBySeq(start + i) }
+    }
+}
+
+private class DoubleRingBuffer(private val capacity: Int) {
+    private val data = DoubleArray(capacity)
+    private var head = 0
+    private var size = 0
+    private var startSeq = 0L
+
+    fun appendAll(values: DoubleArray) {
+        for (v in values) append(v)
+    }
+
+    private fun append(v: Double) {
+        data[head] = v
+        head = (head + 1) % capacity
+        if (size < capacity) size++ else startSeq++
+    }
+
+    private fun getBySeq(seq: Long): Double {
+        val idx = (seq - startSeq).toInt()
+        require(idx in 0 until size) { "seq out of range" }
+        val physical = (head - size + idx).floorMod(capacity)
+        return data[physical]
+    }
+
+    fun snapshotLast(maxPoints: Int): List<Double> {
+        val n = min(size, maxPoints)
+        val start = startSeq + size - n
+        return List(n) { i -> getBySeq(start + i) }
+    }
+
+    fun clear() {
+        head = 0
+        size = 0
+        startSeq = 0L
+    }
+}
+
+data class ProcParams(
+    val version: Long,
+    val type: String,
+    val sgWindow: Int,
+    val sgOrder: Int,
+    val kalmanQ: Double,
+    val kalmanR: Double
+)
+
+data class ProcResponse(
+    val channel: Int,
+    val seqStart: Long,
+    val paramsVersion: Long,
+    val filtered: DoubleArray
+)
+
+interface ProcessorClient {
+    fun process(
+        channel: Int,
+        seqStart: Long,
+        rawTail: IntArray,
+        rawChunk: IntArray,
+        params: ProcParams
+    ): ProcResponse
+}
+
+private class LocalProcessorClient(
+    private val kalmanX: MutableMap<Int, Double>,
+    private val kalmanP: MutableMap<Int, Double>
+) : ProcessorClient {
+
+    override fun process(
+        channel: Int,
+        seqStart: Long,
+        rawTail: IntArray,
+        rawChunk: IntArray,
+        params: ProcParams
+    ): ProcResponse {
+        val out: DoubleArray = when (params.type) {
+            "SG" -> {
+                val combined = ArrayList<Int>(rawTail.size + rawChunk.size)
+                for (v in rawTail) combined.add(v)
+                for (v in rawChunk) combined.add(v)
+
+                val yInt = savitzkyGolayFilterTrue(combined, params.sgWindow, params.sgOrder)
+                val dropped = rawTail.size
+                DoubleArray(rawChunk.size) { i -> yInt[i + dropped].toDouble() }
+            }
+
+            "Kalman" -> {
+                val Q = params.kalmanQ
+                val R = params.kalmanR
+
+                var x: Double = kalmanX[channel] ?: (rawChunk.firstOrNull()?.toDouble() ?: 0.0)
+                var P: Double = kalmanP[channel] ?: 1.0
+
+                val y = DoubleArray(rawChunk.size)
+                for (i in rawChunk.indices) {
+                    val z = rawChunk[i].toDouble()
+                    val xPred = x
+                    val PPred = P + Q
+                    val K = PPred / (PPred + R)
+                    x = xPred + K * (z - xPred)
+                    P = (1.0 - K) * PPred
+                    y[i] = x
+                }
+                kalmanX[channel] = x
+                kalmanP[channel] = P
+                y
+            }
+
+            else -> DoubleArray(rawChunk.size) { i -> rawChunk[i].toDouble() }
+        }
+
+        return ProcResponse(
+            channel = channel,
+            seqStart = seqStart,
+            paramsVersion = params.version,
+            filtered = out
+        )
+    }
+}
+
+/* ======================== CSV EXPORT (MANUAL ON SAVE) ============================ */
+
+private fun exportCsvSnapshotToExperiments(
+    rawBufByChannel: Map<Int, IntRingBuffer>,
+    filtBufByChannel: Map<Int, DoubleRingBuffer>,
+    rawMax: Int,
+    filtMax: Int
+): File {
+    val dir = File("newest_experiments")
+    dir.mkdirs()
+
+    val ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
+    val outFile = File(dir, "experiment_$ts.csv")
+
+    val sb = StringBuilder()
+    sb.appendLine("channel,index,raw,filtered")
+
+    val channels = (rawBufByChannel.keys + filtBufByChannel.keys).toSortedSet()
+    for (ch in channels) {
+        val raw = rawBufByChannel[ch]?.snapshotLast(rawMax).orEmpty()
+        val filt = filtBufByChannel[ch]?.snapshotLast(filtMax).orEmpty()
+        val n = max(raw.size, filt.size)
+        for (i in 0 until n) {
+            val r = raw.getOrNull(i)
+            val f = filt.getOrNull(i)
+            sb.append(ch).append(',')
+                .append(i).append(',')
+                .append(r?.toString() ?: "").append(',')
+                .append(f?.let { "%.6f".format(it) } ?: "")
+                .appendLine()
+        }
+    }
+
+    outFile.writeText(sb.toString())
     return outFile
+}
+
+private suspend fun awaitFilterCatchUp(
+    rawBufByChannel: Map<Int, IntRingBuffer>,
+    nextSeqToProcess: Map<Int, Long>,
+    timeoutMs: Long = 3000L,
+    pollMs: Long = 25L
+): Boolean {
+    val start = System.currentTimeMillis()
+    while (System.currentTimeMillis() - start <= timeoutMs) {
+        var allDone = true
+        for (ch in rawBufByChannel.keys) {
+            val raw = rawBufByChannel[ch] ?: continue
+            val need = raw.newestSeqExclusive()
+            val cur = nextSeqToProcess[ch] ?: raw.oldestSeq()
+            if (cur < need) {
+                allDone = false
+                break
+            }
+        }
+        if (allDone) return true
+        delay(pollMs)
+    }
+    return false
 }
 
 /* ======================== MAIN UI ============================ */
@@ -391,125 +566,253 @@ fun DesktopUI() {
     var showPlot by remember { mutableStateOf(false) }
 
     val sensorMessagesList = remember { mutableStateListOf<String>() }
-    var channelMap by remember { mutableStateOf<MutableMap<Int, MutableList<Int>>>(mutableStateMapOf()) }
-    var filteredMap by remember { mutableStateOf<MutableMap<Int, MutableList<Int>>>(mutableStateMapOf()) }
     var showAlertDialog by remember { mutableStateOf(false) }
 
+    // NEW: scope untuk call suspend dari onClick
+    val scope = rememberCoroutineScope()
+
+    // ===== Filter UI states (PENDING / preview) =====
     var selectedFilter by remember { mutableStateOf("SG") }
     var sgWindow by remember { mutableStateOf(7) }
     var sgOrder by remember { mutableStateOf(2) }
     var kalmanQ by remember { mutableStateOf(0.01f) }
     var kalmanR by remember { mutableStateOf(1.0f) }
 
+    // ===== Filter APPLIED states (yang dipakai pipeline) =====
+    var appliedFilter by remember { mutableStateOf(selectedFilter) }
+    var appliedSgWindow by remember { mutableStateOf(sgWindow) }
+    var appliedSgOrder by remember { mutableStateOf(sgOrder) }
+    var appliedKalmanQ by remember { mutableStateOf(kalmanQ.toDouble()) }
+    var appliedKalmanR by remember { mutableStateOf(kalmanR.toDouble()) }
+
+    var paramsVersion by remember { mutableStateOf(0L) }
+
     val filters = listOf("SG", "Kalman")
-    val coroutineScope = rememberCoroutineScope()
 
-    // ===== ADDED: experiment tracking =====
-    var currentExperimentNo by remember { mutableStateOf<Int?>(null) }
-    var awaitingDoneToSave by remember { mutableStateOf(false) }
-    var lastSavedCsvName by remember { mutableStateOf<String?>(null) }
+    val runEpoch = remember { AtomicLong(0L) }
+    val mqttQueue = remember { Channel<Pair<Long, String>>(capacity = Channel.BUFFERED) }
 
-    val filteredSeriesByRep by remember {
-        derivedStateOf {
-            channelMap.keys.sorted().associateWith { rep ->
-                val raw = channelMap[rep]?.toList().orEmpty()
-                if (raw.isNotEmpty()) {
-                    applyFilter(
-                        raw,
-                        selectedFilter,
-                        sgWindow,
-                        sgOrder,
-                        kalmanQ.toDouble(),
-                        kalmanR.toDouble()
-                    )
-                } else emptyList()
+    val RAW_CAP = 200_000
+    val FILT_CAP = 200_000
+    val PLOT_MAX_POINTS = 5_000
+
+    val rawBufByChannel = remember { mutableStateMapOf<Int, IntRingBuffer>() }
+    val filtBufByChannel = remember { mutableStateMapOf<Int, DoubleRingBuffer>() }
+    val nextSeqToProcess = remember { mutableStateMapOf<Int, Long>() }
+
+    val kalmanXByChannel = remember { mutableStateMapOf<Int, Double>() }
+    val kalmanPByChannel = remember { mutableStateMapOf<Int, Double>() }
+
+    val usePython = true
+    val pythonClient = remember { PythonProcessorClient(resourcePath = "worker/python_worker.exe") }
+    val processor: ProcessorClient = remember {
+        if (usePython) pythonClient else LocalProcessorClient(kalmanXByChannel, kalmanPByChannel)
+    }
+
+    var uiTick by remember { mutableStateOf(0L) }
+    var procTick by remember { mutableStateOf(0L) }
+
+    var droppedFirstSampleRep1 by remember { mutableStateOf(false) }
+
+    var savedForThisRun by remember { mutableStateOf(false) }
+    var runDone by remember { mutableStateOf(false) }
+
+    // NEW: biar tombol Save disable saat proses save berlangsung
+    var savingCsv by remember { mutableStateOf(false) }
+
+    LaunchedEffect(selectedFilter, sgWindow, sgOrder, kalmanQ, kalmanR) {
+        delay(350)
+
+        val w = (if (sgWindow % 2 == 0) sgWindow + 1 else sgWindow).coerceIn(3, 301)
+        val o = sgOrder.coerceIn(2, 10).coerceAtMost((w - 1).coerceAtLeast(2))
+
+        val nextFilter = selectedFilter
+        val nextQ = kalmanQ.toDouble().coerceIn(1e-5, 10.0)
+        val nextR = kalmanR.toDouble().coerceIn(1e-4, 20.0)
+
+        val changed =
+            nextFilter != appliedFilter ||
+                    w != appliedSgWindow ||
+                    o != appliedSgOrder ||
+                    abs(nextQ - appliedKalmanQ) > 1e-12 ||
+                    abs(nextR - appliedKalmanR) > 1e-12
+
+        if (changed) {
+            appliedFilter = nextFilter
+            appliedSgWindow = w
+            appliedSgOrder = o
+            appliedKalmanQ = nextQ
+            appliedKalmanR = nextR
+            paramsVersion++
+
+            for ((_, fbuf) in filtBufByChannel) {
+                fbuf.clear()
+            }
+            kalmanXByChannel.clear()
+            kalmanPByChannel.clear()
+
+            val lookback = max(2048, appliedSgWindow * 8)
+            for ((ch, rbuf) in rawBufByChannel) {
+                val newest = rbuf.newestSeqExclusive()
+                val oldest = rbuf.oldestSeq()
+                val start = max(oldest, newest - lookback)
+                nextSeqToProcess[ch] = start
+            }
+
+            procTick++
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        MQTTClient.onMessageReceived = { message ->
+            mqttQueue.trySend(runEpoch.get() to message)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            val (epoch, message) = mqttQueue.receive()
+            if (epoch != runEpoch.get()) continue
+
+            val lines = message.lines()
+
+            var doneSeen = false
+            var appendedAny = false
+
+            for (rawLine in lines) {
+                val lineNorm = rawLine.trim().removeSurrounding("\"").trim()
+                if (lineNorm.isEmpty()) continue
+
+                if (lineNorm == "DONE") {
+                    doneSeen = true
+                    continue
+                }
+
+                if (lineNorm.contains("Mode:") && lineNorm.contains("START")) {
+                    continue
+                }
+
+                val parts = lineNorm.split(":", limit = 2)
+                val channel = parts.getOrNull(0)?.trim()?.toIntOrNull()
+                val value = parts.getOrNull(1)?.trim()?.toIntOrNull()
+
+                if (channel != null && value != null) {
+                    sensorMessagesList.add("$channel:$value")
+                    if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+
+                    if (channel == 1 && !droppedFirstSampleRep1) {
+                        droppedFirstSampleRep1 = true
+                        continue
+                    }
+
+                    val buf = rawBufByChannel.getOrPut(channel) { IntRingBuffer(RAW_CAP) }
+                    buf.append(value)
+
+                    val cur = nextSeqToProcess[channel]
+                    if (cur == null) nextSeqToProcess[channel] = buf.oldestSeq()
+                    else if (cur < buf.oldestSeq()) nextSeqToProcess[channel] = buf.oldestSeq()
+
+                    filtBufByChannel.getOrPut(channel) { DoubleRingBuffer(FILT_CAP) }
+
+                    appendedAny = true
+                    showPlot = true
+                }
+            }
+
+            if (appendedAny) uiTick++
+
+            if (doneSeen) {
+                runDone = true
+                sensorMessagesList.add("DONE received → ready to save CSV")
+                if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
             }
         }
     }
 
-    val fringeCountByRep by remember {
+    LaunchedEffect(connected, paramsVersion) {
+        if (!connected) return@LaunchedEffect
+
+        val tickMs = 25L
+        val chunkSize = 256
+        val maxChunksPerTickPerChannel = 4
+
+        while (isActive && connected) {
+            delay(tickMs)
+
+            val params = ProcParams(
+                version = paramsVersion,
+                type = appliedFilter,
+                sgWindow = appliedSgWindow,
+                sgOrder = appliedSgOrder,
+                kalmanQ = appliedKalmanQ,
+                kalmanR = appliedKalmanR
+            )
+
+            var processedAny = false
+
+            for (ch in rawBufByChannel.keys.sorted()) {
+                val rawBuf = rawBufByChannel[ch] ?: continue
+                val filtBuf = filtBufByChannel.getOrPut(ch) { DoubleRingBuffer(FILT_CAP) }
+
+                var seq = nextSeqToProcess[ch] ?: rawBuf.oldestSeq()
+                if (seq < rawBuf.oldestSeq()) seq = rawBuf.oldestSeq()
+
+                var processed = 0
+                while (seq < rawBuf.newestSeqExclusive() && processed < maxChunksPerTickPerChannel) {
+                    val chunk = rawBuf.readChunk(seq, chunkSize)
+                    if (chunk.isEmpty()) break
+
+                    val tailLen = if (params.type == "SG") (params.sgWindow - 1).coerceAtLeast(0) else 0
+                    val tail = if (tailLen > 0) rawBuf.readChunk(seq - tailLen, tailLen) else IntArray(0)
+
+                    val resp = processor.process(
+                        channel = ch,
+                        seqStart = seq,
+                        rawTail = tail,
+                        rawChunk = chunk,
+                        params = params
+                    )
+
+                    if (resp.paramsVersion != paramsVersion) break
+
+                    filtBuf.appendAll(resp.filtered)
+
+                    seq += chunk.size
+                    processed++
+                    processedAny = true
+                }
+
+                nextSeqToProcess[ch] = seq
+            }
+
+            if (processedAny) {
+                procTick++
+            }
+        }
+    }
+
+    val rawMapForPlot by remember(uiTick) {
         derivedStateOf {
-            filteredSeriesByRep.mapValues { (_, filteredSeries) ->
-                countFringesFromPeaks(filteredSeries)
+            rawBufByChannel.mapValues { (_, buf) -> buf.snapshotLast(PLOT_MAX_POINTS) }
+        }
+    }
+    val filteredMapForPlot by remember(procTick) {
+        derivedStateOf {
+            filtBufByChannel.mapValues { (_, buf) -> buf.snapshotLast(PLOT_MAX_POINTS) }
+        }
+    }
+
+    val fringeCountByRep by remember(procTick) {
+        derivedStateOf {
+            filteredMapForPlot.keys.sorted().associateWith { rep ->
+                val filtered = filteredMapForPlot[rep].orEmpty()
+                countFringesFromPeaksDouble(filtered)
             }
         }
     }
 
     val latestRep by remember { derivedStateOf { fringeCountByRep.keys.maxOrNull() } }
-    val latestFringeCount by remember {
-        derivedStateOf { latestRep?.let { fringeCountByRep[it] } ?: 0 }
-    }
-
-    var droppedFirstSampleRep1 by remember { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) {
-
-        MQTTClient.onMessageReceived = { message ->
-            coroutineScope.launch(Dispatchers.Main) {
-
-                val msgTrim = message.trim()
-
-                // ===== ADDED: DONE handler =====
-                if (msgTrim == "DONE") {
-                    val expNo = currentExperimentNo
-                    if (awaitingDoneToSave && expNo != null) {
-                        val channelSnap: Map<Int, List<Int>> =
-                            channelMap.mapValues { it.value.toList() }.toMap()
-                        val filteredSnap: Map<Int, List<Int>> =
-                            filteredMap.mapValues { it.value.toList() }.toMap()
-
-                        awaitingDoneToSave = false
-
-                        coroutineScope.launch(Dispatchers.IO) {
-                            val f = writeExperimentCsv(expNo, channelSnap, filteredSnap)
-                            launch(Dispatchers.Main) {
-                                lastSavedCsvName = f.name
-                                sensorMessagesList.add("Saved CSV: ${f.name}")
-                                if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-                            }
-                        }
-                    }
-                    return@launch
-                }
-
-                val isControlMessage = message.contains("Mode:") && message.contains("START")
-                if (isControlMessage) return@launch
-
-                message.lines().forEach { line ->
-                    val parts = line.split(":")
-                    val channel = parts.getOrNull(0)?.toIntOrNull()
-                    val value = parts.getOrNull(1)?.toIntOrNull()
-
-                    if (channel != null && value != null) {
-
-                        sensorMessagesList.add(line)
-                        if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-
-                        if (channel == 1 && !droppedFirstSampleRep1) {
-                            droppedFirstSampleRep1 = true
-                            return@forEach
-                        }
-
-                        val list = channelMap.getOrPut(channel) { mutableStateListOf() }
-                        list.add(value)
-                        if (list.size > 2000) list.removeFirst()
-
-                        val filtered = applyFilter(
-                            list.toList(),
-                            selectedFilter,
-                            sgWindow,
-                            sgOrder,
-                            kalmanQ.toDouble(),
-                            kalmanR.toDouble()
-                        )
-                        filteredMap[channel] = filtered.toMutableList()
-
-                        showPlot = true
-                    }
-                }
-            }
-        }
-    }
+    val latestFringeCount by remember { derivedStateOf { latestRep?.let { fringeCountByRep[it] } ?: 0 } }
 
     Column(
         modifier = Modifier
@@ -584,7 +887,12 @@ fun DesktopUI() {
                                 Column(Modifier.padding(12.dp)) {
                                     Text("Status", fontWeight = FontWeight.SemiBold, color = PremiumTokens.Text)
                                     StatusIndicator(connected) {
-                                        if (connected) MQTTClient.disconnect() else MQTTClient.connect()
+                                        if (connected) {
+                                            MQTTClient.disconnect()
+                                            pythonClient.stop()
+                                        } else {
+                                            MQTTClient.connect()
+                                        }
                                         connected = !connected
                                     }
                                 }
@@ -603,16 +911,6 @@ fun DesktopUI() {
                                     ModeSelectionChipGroup(mode) { newMode -> mode = newMode }
                                 }
                             }
-
-//                            if (lastSavedCsvName != null) {
-//                                Spacer(Modifier.height(12.dp))
-//                                Text(
-//                                    "Last saved: $lastSavedCsvName",
-//                                    color = PremiumTokens.TextMuted,
-//                                    fontSize = 12.sp,
-//                                    fontWeight = FontWeight.Medium
-//                                )
-//                            }
                         }
 
                         Row(modifier = Modifier.weight(2f), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -640,12 +938,8 @@ fun DesktopUI() {
                                         if (showPlot) {
                                             Spacer(Modifier.height(2.dp))
                                             DataPlotSection(
-                                                channelMap = channelMap,
-                                                selectedFilter = selectedFilter,
-                                                sgWindow = sgWindow,
-                                                sgOrder = sgOrder,
-                                                kalmanQ = kalmanQ.toDouble(),
-                                                kalmanR = kalmanR.toDouble()
+                                                channelMap = rawMapForPlot,
+                                                filteredMap = filteredMapForPlot
                                             )
                                         }
                                     }
@@ -653,6 +947,7 @@ fun DesktopUI() {
                             }
                         }
 
+                        /* =============== Filter Settings Card =============== */
                         Card(
                             modifier = Modifier
                                 .weight(1f)
@@ -866,6 +1161,8 @@ fun DesktopUI() {
                         }
                     }
 
+                    /* =============== Settings & Start Cards =============== */
+
                     if (showAlertDialog) {
                         AlertDialog(
                             onDismissRequest = { showAlertDialog = false },
@@ -978,38 +1275,111 @@ fun DesktopUI() {
                         elevation = PremiumTokens.cardElevation()
                     ) {
                         Column(Modifier.padding(12.dp), horizontalAlignment = Alignment.End) {
-                            Button(
-                                onClick = {
-                                    if (angle.toIntOrNull() == null && angle.isNotEmpty() ||
-                                        speed.toIntOrNull() == null && speed.isNotEmpty() ||
-                                        repetitions.toIntOrNull() == null && repetitions.isNotEmpty()
-                                    ) {
-                                        showAlertDialog = true
-                                    } else if (connected) {
-                                        // ===== ADDED: allocate new experiment number on Start =====
-                                        val expNo = nextExperimentNumber()
-                                        currentExperimentNo = expNo
-                                        awaitingDoneToSave = true
-                                        lastSavedCsvName = null
 
-                                        channelMap.clear()
-                                        filteredMap.clear()
-                                        droppedFirstSampleRep1 = false
-                                        showPlot = true
-                                        val cmd =
-                                            "Mode:$mode;${if (mode == "Rotasi") "Angle" else "Distance"}:$angle;" +
-                                                    "Speed:$speed;Repetitions:$repetitions;START"
-                                        MQTTClient.publish(cmd)
-                                    }
-                                },
+                            Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = PremiumTokens.Primary,
-                                    contentColor = Color.White
-                                ),
-                                elevation = PremiumTokens.buttonElevation(),
-                                shape = RoundedCornerShape(12.dp)
-                            ) { Text("Start", fontWeight = FontWeight.SemiBold) }
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+
+                                Button(
+                                    onClick = {
+                                        if (angle.toIntOrNull() == null && angle.isNotEmpty() ||
+                                            speed.toIntOrNull() == null && speed.isNotEmpty() ||
+                                            repetitions.toIntOrNull() == null && repetitions.isNotEmpty()
+                                        ) {
+                                            showAlertDialog = true
+                                        } else if (connected) {
+                                            runEpoch.incrementAndGet()
+                                            sensorMessagesList.clear()
+
+                                            rawBufByChannel.clear()
+                                            filtBufByChannel.clear()
+                                            nextSeqToProcess.clear()
+                                            kalmanXByChannel.clear()
+                                            kalmanPByChannel.clear()
+                                            droppedFirstSampleRep1 = false
+
+                                            savedForThisRun = false
+                                            runDone = false
+                                            savingCsv = false
+
+                                            uiTick++
+                                            procTick++
+
+                                            showPlot = true
+                                            val cmd =
+                                                "Mode:$mode;${if (mode == "Rotasi") "Angle" else "Distance"}:$angle;" +
+                                                        "Speed:$speed;Repetitions:$repetitions;START"
+                                            MQTTClient.publish(cmd)
+                                        }
+                                    },
+                                    modifier = Modifier.weight(2f),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = PremiumTokens.Primary,
+                                        contentColor = Color.White
+                                    ),
+                                    elevation = PremiumTokens.buttonElevation(),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) { Text("Start", fontWeight = FontWeight.SemiBold) }
+
+                                val saveGreen = Color(0xFF16A34A)          // green-600
+                                val saveGreenDisabled = Color(0xFF16A34A).copy(alpha = 0.45f)
+
+                                Button(
+                                    onClick = {
+                                        if (!runDone || savedForThisRun || savingCsv) return@Button
+
+                                        scope.launch {
+                                            savingCsv = true
+                                            try {
+                                                val ok = runCatching {
+                                                    awaitFilterCatchUp(
+                                                        rawBufByChannel = rawBufByChannel,
+                                                        nextSeqToProcess = nextSeqToProcess,
+                                                        timeoutMs = 3000L,
+                                                        pollMs = 25L
+                                                    )
+                                                }.getOrDefault(false)
+
+                                                val result = runCatching {
+                                                    exportCsvSnapshotToExperiments(
+                                                        rawBufByChannel = rawBufByChannel,
+                                                        filtBufByChannel = filtBufByChannel,
+                                                        rawMax = RAW_CAP,
+                                                        filtMax = FILT_CAP
+                                                    )
+                                                }
+
+                                                result.onSuccess { file ->
+                                                    sensorMessagesList.add(
+                                                        if (ok) "CSV saved: ${file.absolutePath}"
+                                                        else "CSV saved (catch-up timeout): ${file.absolutePath}"
+                                                    )
+                                                    if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+                                                    savedForThisRun = true
+                                                }.onFailure { e ->
+                                                    sensorMessagesList.add("CSV FAILED: ${e::class.simpleName}: ${e.message}")
+                                                    if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+                                                }
+                                            } finally {
+                                                savingCsv = false
+                                            }
+                                        }
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                    enabled = runDone && !savedForThisRun && !savingCsv,
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = saveGreen,
+                                        contentColor = Color.White,
+                                        disabledContainerColor = saveGreenDisabled,
+                                        disabledContentColor = Color.White.copy(alpha = 0.7f)
+                                    ),
+                                    elevation = PremiumTokens.buttonElevation(),   // biar “tone” sama seperti Start
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Text(if (savingCsv) "Saving..." else "Save CSV", fontWeight = FontWeight.SemiBold)
+                                }
+                            }
                         }
                     }
                 }
@@ -1019,11 +1389,9 @@ fun DesktopUI() {
 }
 
 /* ======================== FRINGE COUNT LOGIC ============================ */
-/* Peak-to-peak: peak1=0, peak2=1 => fringe = peaks - 1 */
 
 private fun countFringesFromPeaks(values: List<Int>): Int {
-    val normalized = normalizeByEnvelopesOptionA(values)
-    val peaks = detectPeaks(normalized)
+    val peaks = detectPeaks(values)
     return (peaks.size - 1).coerceAtLeast(0)
 }
 
@@ -1060,132 +1428,45 @@ private fun detectPeaks(values: List<Int>): List<Int> {
     return peaks
 }
 
-/* ======================== NORMALIZATION (Option A + Guard) ============================ */
-
-private fun normalizeByEnvelopesOptionA(values: List<Int>): List<Int> {
-    if (values.isEmpty()) return values
-    if (values.size < 3) {
-        return minMaxNormalizeTo1000(values)
-    }
-
-    val peaks = findLocalMaxima(values)
-    val valleys = findLocalMinima(values)
-
-    if (peaks.size < 2 || valleys.size < 2) {
-        return minMaxNormalizeTo1000(values)
-    }
-
-    val upper = buildEnvelope(values.size, peaks)
-    val lower = buildEnvelope(values.size, valleys)
-
-    val eps = 1e-9
-    val out = IntArray(values.size)
-    for (i in values.indices) {
-        val u = upper[i]
-        val l = lower[i]
-        val denom = u - l
-        val y = if (abs(denom) < eps) 0.5 else ((values[i].toDouble() - l) / denom).coerceIn(0.0, 1.0)
-        out[i] = (y * 1000.0).roundToInt().coerceIn(0, 1000)
-    }
-    return out.toList()
+private fun countFringesFromPeaksDouble(values: List<Double>): Int {
+    val peaks = detectPeaksDouble(values)
+    return (peaks.size - 1).coerceAtLeast(0)
 }
 
-private fun minMaxNormalizeTo1000(values: List<Int>): List<Int> {
-    val minV = values.minOrNull() ?: return values
-    val maxV = values.maxOrNull() ?: return values
-    val range = (maxV - minV).toDouble()
-    if (range < 1e-9) {
-        return List(values.size) { 500 }
-    }
-    return values.map { v ->
-        val y = ((v - minV) / range).coerceIn(0.0, 1.0)
-        (y * 1000.0).roundToInt().coerceIn(0, 1000)
-    }
-}
+private fun detectPeaksDouble(values: List<Double>): List<Int> {
+    if (values.size < 3) return emptyList()
 
-private fun findLocalMaxima(values: List<Int>): List<Pair<Int, Double>> {
-    val pts = ArrayList<Pair<Int, Double>>()
+    val minV = values.minOrNull() ?: return emptyList()
+    val maxV = values.maxOrNull() ?: return emptyList()
+    val range = (maxV - minV)
+    if (range < 1e-12) return emptyList()
+
+    val minPeakDistance = 6
+    val peakThreshold = minV + (0.70 * range)
+
+    val peaks = ArrayList<Int>()
+    var lastPeak = -10_000
+
     for (i in 1 until values.lastIndex) {
-        val prev = values[i - 1].toDouble()
-        val curr = values[i].toDouble()
-        val next = values[i + 1].toDouble()
-        val isMax = (curr > prev && curr >= next) || (curr >= prev && curr > next)
-        if (isMax) pts.add(i to curr)
-    }
-    if (pts.isEmpty()) return pts
-    return compressSameIndexKeepBest(pts, pickMax = true)
-}
+        val prev = values[i - 1]
+        val curr = values[i]
+        val next = values[i + 1]
 
-private fun findLocalMinima(values: List<Int>): List<Pair<Int, Double>> {
-    val pts = ArrayList<Pair<Int, Double>>()
-    for (i in 1 until values.lastIndex) {
-        val prev = values[i - 1].toDouble()
-        val curr = values[i].toDouble()
-        val next = values[i + 1].toDouble()
-        val isMin = (curr < prev && curr <= next) || (curr <= prev && curr < next)
-        if (isMin) pts.add(i to curr)
-    }
-    if (pts.isEmpty()) return pts
-    return compressSameIndexKeepBest(pts, pickMax = false)
-}
+        val isLocalMax = (curr > prev && curr >= next) || (curr >= prev && curr > next)
+        if (!isLocalMax) continue
 
-private fun compressSameIndexKeepBest(
-    pts: List<Pair<Int, Double>>,
-    pickMax: Boolean
-): List<Pair<Int, Double>> {
-    if (pts.isEmpty()) return pts
-    val sorted = pts.sortedBy { it.first }
-    val out = ArrayList<Pair<Int, Double>>()
-    var curIdx = sorted[0].first
-    var curVal = sorted[0].second
-    for (k in 1 until sorted.size) {
-        val (idx, v) = sorted[k]
-        if (idx == curIdx) {
-            curVal = if (pickMax) max(curVal, v) else min(curVal, v)
-        } else {
-            out.add(curIdx to curVal)
-            curIdx = idx
-            curVal = v
+        val heightOk = curr >= peakThreshold
+        val distOk = (i - lastPeak) >= minPeakDistance
+
+        if (heightOk && distOk) {
+            peaks.add(i)
+            lastPeak = i
         }
     }
-    out.add(curIdx to curVal)
-    return out
+    return peaks
 }
 
-private fun buildEnvelope(n: Int, points: List<Pair<Int, Double>>): DoubleArray {
-    val env = DoubleArray(n)
-
-    val pts = points.sortedBy { it.first }
-    if (pts.isEmpty()) {
-        for (i in 0 until n) env[i] = 0.0
-        return env
-    }
-
-    val firstIdx = pts.first().first.coerceIn(0, n - 1)
-    val firstVal = pts.first().second
-    for (i in 0..firstIdx) env[i] = firstVal
-
-    for (p in 0 until pts.size - 1) {
-        val (i0, v0) = pts[p]
-        val (i1, v1) = pts[p + 1]
-        val a = i0.coerceIn(0, n - 1)
-        val b = i1.coerceIn(0, n - 1)
-        if (b <= a) continue
-        val len = (b - a).toDouble()
-        for (i in a..b) {
-            val t = (i - a) / len
-            env[i] = v0 + t * (v1 - v0)
-        }
-    }
-
-    val lastIdx = pts.last().first.coerceIn(0, n - 1)
-    val lastVal = pts.last().second
-    for (i in lastIdx until n) env[i] = lastVal
-
-    return env
-}
-
-/* ======================== FILTER LOGIC ============================ */
+/* ======================== FILTER LOGIC (KEPT AS-IS) ============================ */
 
 fun applyFilter(
     values: List<Int>,
