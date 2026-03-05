@@ -1075,24 +1075,11 @@ fun DesktopUI() {
                                     horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
                                     Text(
-                                        "Fringe Count (per repetition)",
+                                        "Fringe Count",
                                         fontWeight = FontWeight.SemiBold,
                                         color = PremiumTokens.Text
                                     )
 
-                                    Surface(
-                                        color = PremiumTokens.PrimarySoft,
-                                        contentColor = PremiumTokens.Primary,
-                                        shape = RoundedCornerShape(999.dp),
-                                        tonalElevation = 2.dp
-                                    ) {
-                                        Text(
-                                            text = "latest n = $latestFringeCount",
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                            fontWeight = FontWeight.SemiBold,
-                                            fontSize = 12.sp
-                                        )
-                                    }
                                 }
 
                                 Spacer(Modifier.height(8.dp))
