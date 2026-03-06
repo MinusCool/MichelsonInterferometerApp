@@ -11,37 +11,34 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
-import org.eclipse.paho.client.mqttv3.MqttCallback
-import org.eclipse.paho.client.mqttv3.MqttClient
-import org.eclipse.paho.client.mqttv3.MqttConnectOptions
-import org.eclipse.paho.client.mqttv3.MqttException
-import org.eclipse.paho.client.mqttv3.MqttMessage
-import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
-/* ======================== LOGCAT TAGS (SESUI SCREENSHOT) ============================ */
-private const val TAG_MQTT_TX = "MQTT-TX"
-private const val TAG_MQTT_RX = "MQTT-RX"
+private const val TAG_WS_TX = "WS-TX"
+private const val TAG_WS_RX = "WS-RX"
 private const val TAG_APP = "APP"
 
-/* ======================== TOPIC (DATA) ============================ */
-private const val TOPIC_DATA = "motor/data"
+/*
+ * Ganti IP ini dengan IP ESP8266 dari Serial Monitor.
+ * Contoh: ws://192.168.1.23:81/
+ */
+private const val WS_URL = "ws://192.168.1.11:81/"
 
-/* ======================== COMMAND PAYLOAD (SAMA PERSIS) ============================ */
-private const val COMMAND_PAYLOAD =
+private const val BASE_COMMAND_PAYLOAD =
     "Mode:Rotasi;Angle:20;Speed:1;Repetitions:20;START"
 
-/* ======================== LOGGING TEST PARAM ============================ */
 private const val LAST_REP = 20
 
-/* ======================== LAST-REP TIMING STATE (LOGGING ONLY) ============================ */
 @Volatile private var gLastRxNs: Long = 0L
 @Volatile private var gLastRepSeen: Int = -1
 @Volatile private var gFinalLogPrinted: Boolean = false
@@ -54,9 +51,6 @@ private fun markLastRepIfNeeded(rep: Int) {
     }
 }
 
-/**
- * Dummy "compute" + log final (SIMULASI 200-400ms).
- */
 private suspend fun maybePrintFinalComputeLog() {
     if (gLastRepSeen != LAST_REP || gFinalLogPrinted) return
 
@@ -72,14 +66,12 @@ private suspend fun maybePrintFinalComputeLog() {
 
     Log.i(
         TAG_APP,
-        "Hasil diproses dari rep terakhir 20/20. | filter=OK (dt=$dtFilterMs ms) | " +
-                "fringeCount=$fringeCountDummy | total(lastRx→compute)=$dtTotalMs ms"
+        "Hasil diproses dari rep terakhir 20/20 | filter=OK (dt=$dtFilterMs ms) | fringeCount=$fringeCountDummy | total(lastRx->compute)=$dtTotalMs ms"
     )
 
     gFinalLogPrinted = true
 }
 
-/* ======================== LOG HELPER ============================ */
 private fun logLong(tag: String, message: String, priority: Int = Log.INFO) {
     val chunkSize = 3500
     if (message.length <= chunkSize) {
@@ -91,6 +83,7 @@ private fun logLong(tag: String, message: String, priority: Int = Log.INFO) {
         }
         return
     }
+
     var start = 0
     while (start < message.length) {
         val end = (start + chunkSize).coerceAtMost(message.length)
@@ -105,179 +98,215 @@ private fun logLong(tag: String, message: String, priority: Int = Log.INFO) {
     }
 }
 
-/* ======================== DATA MQTT CLIENT (khusus motor/data) ============================ */
-/**
- * Tetap connect & subscribe seperti biasa,
- * tapi log repetisi dari callback DIMATIKAN agar tidak dobel dengan “manual print”.
- */
-internal class DataMqttClientSkripsi(
-    private val onDataMessage: (String) -> Unit
-) {
-    private val persistence = MemoryPersistence()
-    private var client: MqttClient? = null
-
-    fun connect() {
-        try {
-            val dataClientId = MQTTConfig.clientId + "_DATA_SKRIPSI"
-            client = MqttClient(MQTTConfig.broker, dataClientId, persistence)
-
-            val connOpts = MqttConnectOptions().apply {
-                isCleanSession = true
-                userName = MQTTConfig.username
-                password = MQTTConfig.password.toCharArray()
-            }
-
-            client?.setCallback(object : MqttCallback {
-                override fun connectionLost(cause: Throwable?) {
-                    Log.e(TAG_APP, "DATA MQTT connection lost: ${cause?.message}")
-                }
-
-                override fun messageArrived(topic: String?, message: MqttMessage?) {
-                    // Tetap terima data (kalau kamu butuh simpan), tapi jangan print log repetisi dari sini
-                    val received = message?.toString().orEmpty()
-                    onDataMessage(received)
-                }
-
-                override fun deliveryComplete(token: IMqttDeliveryToken?) { /* no-op */ }
-            })
-
-            Log.i(TAG_APP, "Connecting DATA client to broker: ${MQTTConfig.broker}")
-            client?.connect(connOpts)
-
-            client?.subscribe(TOPIC_DATA)
-            Log.i(TAG_APP, "DATA client connected and subscribed to $TOPIC_DATA")
-        } catch (e: MqttException) {
-            Log.e(TAG_APP, "DATA client connect error: ${e.message}", e)
-        }
-    }
-}
-
-/* ======================== MANUAL PRINT RX REP LOOP ============================ */
 private fun parseRepetitionsFromCommand(cmd: String): Int {
     val m = Regex("Repetitions:(\\d+)").find(cmd)
     return m?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
 }
 
-/**
- * Print manual “RX repetisi ke-n” tiap 1000ms.
- * Ini simulasi tampilan log (bukan trigger dari MQTT).
- */
-private fun CoroutineScope.startManualRxLogs(
-    topicData: String,
-    totalReps: Int
-): Job = launch {
-    for (rep in 1..totalReps) {
-        delay(1000L)
+private fun buildCommandPayload(): String {
+    return BASE_COMMAND_PAYLOAD
+}
 
-        // anchor waktu rep terakhir untuk dummy compute (biar log final tetap jalan)
-        markLastRepIfNeeded(rep)
+internal class EspWebSocketClient(
+    private val url: String,
+    private val onStatusChanged: (Boolean, String) -> Unit,
+    private val onTextMessage: (String) -> Unit,
+    private val onError: (String) -> Unit
+) {
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .retryOnConnectionFailure(true)
+        .build()
 
-        logLong(
-            TAG_MQTT_RX,
-            "Transmisi data repetisi ke-$rep berhasil (app menerima dari ESP32). topic=$topicData.",
-            Log.INFO
-        )
+    private var webSocket: WebSocket? = null
 
-        if (rep == LAST_REP) {
-            launch(Dispatchers.Default) { maybePrintFinalComputeLog() }
-        }
+    fun connect() {
+        val request = Request.Builder()
+            .url(url)
+            .build()
+
+        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                Log.i(TAG_APP, "WebSocket connected: $url")
+                onStatusChanged(true, "Connected")
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                onTextMessage(text)
+            }
+
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                onTextMessage(bytes.utf8())
+            }
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                Log.w(TAG_APP, "WebSocket closing: $code / $reason")
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                Log.i(TAG_APP, "WebSocket closed: $code / $reason")
+                onStatusChanged(false, "Closed: $reason")
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                Log.e(TAG_APP, "WebSocket failure: ${t.message}", t)
+                onStatusChanged(false, "Failure")
+                onError(t.message ?: "unknown websocket error")
+            }
+        })
+    }
+
+    fun send(text: String): Boolean {
+        return webSocket?.send(text) == true
+    }
+
+    fun disconnect() {
+        webSocket?.close(1000, "manual_close")
+        webSocket = null
+        onStatusChanged(false, "Disconnected")
     }
 }
 
-/* ======================== ANDROID UI (LOGGER + BUTTONS) ============================ */
 @Composable
 fun AndroidUISkripsi() {
     val scope = rememberCoroutineScope()
 
     var isConnected by remember { mutableStateOf(false) }
     var isConnecting by remember { mutableStateOf(false) }
+    var statusText by remember { mutableStateOf("Belum terhubung") }
 
-    val topicCommand = remember { MQTTConfig.topic }
+    val wsClient = remember {
+        EspWebSocketClient(
+            url = WS_URL,
+            onStatusChanged = { connected, message ->
+                isConnected = connected
+                isConnecting = false
+                statusText = message
+            },
+            onTextMessage = { message ->
+                try {
+                    Log.i(TAG_APP, "Message received: $message")
+                    println("Message received: $message")
 
-    // Job untuk menghentikan manual log jika tombol dipencet lagi
-    var manualLogJob by remember { mutableStateOf<Job?>(null) }
+                    val json = JSONObject(message)
+                    when (json.optString("type")) {
+                        "hello" -> {
+                            logLong(TAG_WS_RX, "RX HELLO dari ESP: $message", Log.INFO)
+                        }
 
-    val dataClient = remember {
-        DataMqttClientSkripsi { /* kalau mau simpan payload, taruh di sini */ }
-    }
+                        "ack" -> {
+                            logLong(TAG_WS_RX, "ACK command diterima ESP: $message", Log.INFO)
+                        }
 
-    LaunchedEffect(Unit) {
-        MQTTClient.onMessageReceived = { message ->
-            Log.i(TAG_APP, "Message received: $message")
-            println("Message received: $message")
-            logLong(
-                TAG_MQTT_RX,
-                "RX (via MQTTClient topic=$topicCommand):\n$message",
-                Log.INFO
-            )
-        }
-        Log.i(TAG_APP, "AndroidUISkripsi ready. commandTopic=$topicCommand")
+                        "pong" -> {
+                            logLong(TAG_WS_RX, "PONG dari ESP", Log.DEBUG)
+                        }
+
+                        "rep" -> {
+                            val rep = json.optInt("rep", -1)
+                            val raw = json.optString("raw")
+
+                            markLastRepIfNeeded(rep)
+
+                            logLong(
+                                TAG_WS_RX,
+                                "Transmisi data repetisi ke-$rep berhasil (app menerima dari ESP). payload=$raw",
+                                Log.INFO
+                            )
+
+                            if (rep == LAST_REP) {
+                                scope.launch(Dispatchers.Default) {
+                                    maybePrintFinalComputeLog()
+                                }
+                            }
+                        }
+
+                        "done" -> {
+                            logLong(TAG_WS_RX, "Semua repetisi selesai dikirim dari ESP.", Log.INFO)
+                        }
+
+                        "error" -> {
+                            val err = json.optString("message", "unknown_error")
+                            Log.e(TAG_APP, "ESP error: $err")
+                        }
+
+                        else -> {
+                            logLong(TAG_WS_RX, "RX unknown payload: $message", Log.WARN)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG_APP, "Failed parsing WS message: ${e.message}", e)
+                    logLong(TAG_WS_RX, "RAW RX: $message", Log.WARN)
+                }
+            },
+            onError = { err ->
+                isConnecting = false
+                statusText = "Error: $err"
+                Log.e(TAG_APP, "WS error: $err")
+            }
+        )
     }
 
     Column(
         modifier = Modifier.padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        Text("Status: $statusText")
+        Text("WS URL: $WS_URL")
+
         Button(
             modifier = Modifier.fillMaxWidth(),
             enabled = !isConnecting && !isConnected,
             onClick = {
                 isConnecting = true
-                scope.launch {
-                    val ok = runCatching { MQTTClient.connect() }
-                        .onFailure { e ->
-                            Log.i(TAG_APP, "Error Connecting: ${e.message}")
-                            println("Error Connecting: ${e.message}")
-                        }
-                        .isSuccess
-
-                    if (ok) {
-                        withContext(Dispatchers.IO) { dataClient.connect() }
-                        isConnected = true
-                        Log.i(TAG_APP, "Connected (command + data).")
-                    }
-                    isConnecting = false
-                }
+                statusText = "Connecting..."
+                wsClient.connect()
             }
-        ) { Text(if (isConnecting) "Connecting..." else "Connect MQTT") }
+        ) {
+            Text(if (isConnecting) "Connecting..." else "Connect WebSocket")
+        }
 
         Button(
             modifier = Modifier.fillMaxWidth(),
             enabled = isConnected,
             onClick = {
-                scope.launch {
-                    // stop manual log lama jika ada
-                    manualLogJob?.cancel()
-                    manualLogJob = null
+                val commandPayload = buildCommandPayload()
+                val reps = parseRepetitionsFromCommand(commandPayload)
 
-                    // 1) PRINT DULU
-                    Log.i(TAG_APP, "Message published: $COMMAND_PAYLOAD")
-                    println("Message published: $COMMAND_PAYLOAD")
-                    Log.i(
-                        TAG_MQTT_TX,
-                        "Transmisi data berhasil (app mengirim ke ESP32). topic=$topicCommand"
-                    )
+                Log.i(TAG_APP, "Message sent: $commandPayload")
+                Log.i(TAG_WS_TX, "Command dikirim ke ESP via WebSocket. totalReps=$reps")
 
-                    // 2) delay (kalau mau)
-                    delay(1000)
-
-                    // 3) publish command
-                    val ok = runCatching { MQTTClient.publish(COMMAND_PAYLOAD) }
-                        .onFailure { e ->
-                            Log.i(TAG_APP, "Error Publishing: ${e.message}")
-                            println("Error Publishing: ${e.message}")
-                        }
-                        .isSuccess
-
-                    if (!ok) return@launch
-
-                    // 4) START MANUAL RX LOG 1 detik sekali
-                    val reps = parseRepetitionsFromCommand(COMMAND_PAYLOAD)
-                    manualLogJob = scope.startManualRxLogs(TOPIC_DATA, reps)
+                val ok = wsClient.send(commandPayload)
+                if (!ok) {
+                    Log.e(TAG_APP, "Gagal mengirim command via WebSocket")
                 }
             }
         ) {
             Text("Kirim Command ke ESP")
+        }
+
+        Button(
+            modifier = Modifier.fillMaxWidth(),
+            enabled = isConnected,
+            onClick = {
+                val ok = wsClient.send("ping")
+                if (ok) {
+                    Log.d(TAG_WS_TX, "Ping sent")
+                }
+            }
+        ) {
+            Text("Ping ESP")
+        }
+
+        Button(
+            modifier = Modifier.fillMaxWidth(),
+            enabled = isConnected,
+            onClick = {
+                wsClient.disconnect()
+            }
+        ) {
+            Text("Disconnect")
         }
     }
 }

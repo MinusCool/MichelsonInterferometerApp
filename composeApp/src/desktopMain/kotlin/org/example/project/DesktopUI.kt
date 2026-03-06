@@ -802,14 +802,16 @@ fun DesktopUI() {
         }
     }
 
+    // =================== REVISI: PEAK COUNT -> ZERO CROSSING ===================
     val fringeCountByRep by remember(procTick) {
         derivedStateOf {
             filteredMapForPlot.keys.sorted().associateWith { rep ->
                 val filtered = filteredMapForPlot[rep].orEmpty()
-                countFringesFromPeaksDouble(filtered)
+                countFringesFromZeroCrossingDouble(filtered)
             }
         }
     }
+    // ==========================================================================
 
     val latestRep by remember { derivedStateOf { fringeCountByRep.keys.maxOrNull() } }
     val latestFringeCount by remember { derivedStateOf { latestRep?.let { fringeCountByRep[it] } ?: 0 } }
@@ -1452,6 +1454,94 @@ private fun detectPeaksDouble(values: List<Double>): List<Int> {
     }
     return peaks
 }
+
+/* ======================== REVISI: ZERO CROSSING FRINGE COUNT ============================ */
+/**
+ * Zero-crossing dengan detrend (baseline moving average) + smoothing ringan + hysteresis (deadband).
+ * Menghitung UP-crossing (dari bawah ke atas), sehingga 1 periode ~ 1 hitungan.
+ *
+ * Tidak memakai threshold tinggi puncak, jadi puncak kecil tetap terhitung selama masih menyeberang baseline.
+ */
+private fun countFringesFromZeroCrossingDouble(
+    values: List<Double>,
+    baselineWindow: Int = 201,    // harus lebih besar dari periode fringe
+    smoothWindow: Int = 9,        // smoothing ringan anti noise
+    epsFraction: Double = 0.12,   // deadband relatif dari skala sinyal (median abs)
+    minEps: Double = 0.5          // deadband minimum (anti jitter)
+): Int {
+    if (values.size < 5) return 0
+
+    val base = movingAverageCentered(values, baselineWindow)
+    val detrended = DoubleArray(values.size) { i -> values[i] - base[i] }
+
+    val smooth = movingAverageCentered(detrended.asList(), smoothWindow)
+    val y = DoubleArray(values.size) { i -> smooth[i] }
+
+    // skala robust: median(|y|)
+    val absMed = medianAbs(y)
+    val eps = max(minEps, epsFraction * absMed)
+
+    // Hysteresis state machine: -1 below, +1 above, 0 unknown
+    var state = 0
+    var upCrossings = 0
+
+    for (v in y) {
+        when {
+            v > +eps -> {
+                if (state <= 0) upCrossings++
+                state = +1
+            }
+            v < -eps -> state = -1
+            else -> {
+                // within deadband: keep state
+            }
+        }
+    }
+
+    return upCrossings.coerceAtLeast(0)
+}
+
+/**
+ * Moving average "centered" dengan edge clamp (replicate edge).
+ * Window dipaksa ganjil.
+ */
+private fun movingAverageCentered(values: List<Double>, window: Int): DoubleArray {
+    val n = values.size
+    if (n == 0) return DoubleArray(0)
+
+    val w = window.coerceAtLeast(1).let { if (it % 2 == 0) it + 1 else it }
+    val half = w / 2
+    val out = DoubleArray(n)
+
+    fun getClamped(i: Int): Double {
+        val idx = i.coerceIn(0, n - 1)
+        return values[idx]
+    }
+
+    var sum = 0.0
+    val count = w
+
+    // init i=0 window centered at 0 => indices [-half..+half] (clamped)
+    for (k in -half..half) sum += getClamped(k)
+    out[0] = sum / count
+
+    for (i in 1 until n) {
+        sum -= getClamped(i - 1 - half)
+        sum += getClamped(i + half)
+        out[i] = sum / count
+    }
+
+    return out
+}
+
+private fun medianAbs(x: DoubleArray): Double {
+    if (x.isEmpty()) return 0.0
+    val a = DoubleArray(x.size) { i -> kotlin.math.abs(x[i]) }
+    a.sort()
+    val mid = a.size / 2
+    return if (a.size % 2 == 1) a[mid] else (a[mid - 1] + a[mid]) * 0.5
+}
+/* ======================== END REVISI ============================ */
 
 /* ======================== FILTER LOGIC (KEPT AS-IS) ============================ */
 

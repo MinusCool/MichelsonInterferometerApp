@@ -44,6 +44,7 @@ kotlin {
             implementation(libs.androidx.activity.compose)
             implementation("org.eclipse.paho:org.eclipse.paho.android.service:1.1.1")
             implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
+            implementation("com.squareup.okhttp3:okhttp:4.12.0")
         }
 
         commonMain.dependencies {
