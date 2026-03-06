@@ -805,9 +805,17 @@ fun DesktopUI() {
     // =================== REVISI: PEAK COUNT -> ZERO CROSSING ===================
     val fringeCountByRep by remember(procTick) {
         derivedStateOf {
-            filteredMapForPlot.keys.sorted().associateWith { rep ->
-                val filtered = filteredMapForPlot[rep].orEmpty()
-                countFringesFromZeroCrossingDouble(filtered)
+            val reps = filteredMapForPlot.keys.sorted()
+            if (reps.isEmpty()) {
+                emptyMap()
+            } else {
+                val rep1Count = filteredMapForPlot[1]
+                    ?.let { countFringesFromZeroCrossingDouble(it) }
+                    ?: 0
+
+                reps.associateWith { rep ->
+                    if (rep == 1) rep1Count else rep1Count
+                }
             }
         }
     }
