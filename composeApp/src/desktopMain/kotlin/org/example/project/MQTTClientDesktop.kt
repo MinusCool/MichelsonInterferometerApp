@@ -7,7 +7,8 @@ actual object MQTTClient {
     private val persistence = MemoryPersistence()
     private var mqttClient: MqttClient? = null
 
-    actual var onMessageReceived: (String) -> Unit = {}
+    // kirim topic + payload ke UI
+    actual var onMessageReceived: (String, String) -> Unit = { _, _ -> }
 
     actual fun connect() {
         try {
@@ -24,21 +25,26 @@ actual object MQTTClient {
                 }
 
                 override fun messageArrived(topic: String?, message: MqttMessage?) {
+                    val t = topic ?: ""
                     val received = message?.toString() ?: ""
-                    println("Message received: $received")
-                    onMessageReceived(received)  // Kirim ke UI
+                    println("Message received [$t]: $received")
+                    onMessageReceived(t, received)
                 }
 
                 override fun deliveryComplete(token: IMqttDeliveryToken?) {
-                    // Tidak perlu diproses untuk sekadar menerima pesan
                 }
             })
 
-            println("Connecting to broker: $MQTTConfig.broker")
+            println("Connecting to broker: ${MQTTConfig.broker}")
             mqttClient?.connect(connOpts)
-            mqttClient?.subscribe(MQTTConfig.topic)  // Subscribe ke topik saat connect
-            println("Connected and subscribed to $MQTTConfig.topic")
 
+            // subscribe hanya ke topic output dari ESP32
+            mqttClient?.subscribe(MQTTConfig.topicData)
+            mqttClient?.subscribe(MQTTConfig.topicStatus)
+
+            println(
+                "Connected and subscribed to ${MQTTConfig.topicData} and ${MQTTConfig.topicStatus}"
+            )
         } catch (e: MqttException) {
             println("Error Connecting: ${e.message}")
         }
@@ -55,8 +61,11 @@ actual object MQTTClient {
 
     actual fun publish(message: String) {
         try {
-            mqttClient?.publish(MQTTConfig.topic, MqttMessage(message.toByteArray()))
-            println("Message published: $message")
+            mqttClient?.publish(
+                MQTTConfig.topicCommand,
+                MqttMessage(message.toByteArray())
+            )
+            println("Message published to ${MQTTConfig.topicCommand}: $message")
         } catch (e: MqttException) {
             println("Error Publishing: ${e.message}")
         }

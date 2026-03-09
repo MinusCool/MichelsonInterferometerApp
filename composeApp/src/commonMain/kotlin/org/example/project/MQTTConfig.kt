@@ -5,5 +5,7 @@ object MQTTConfig {
     const val clientId = "InterferometerKMPClient"
     const val username = "MinusCool"
     const val password = "Interfero123"
-    const val topic = "motor/commands"
+    const val topicCommand = "motor/commands"
+    const val topicData = "motor/data"
+    const val topicStatus = "motor/status"
 }

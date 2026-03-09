@@ -24,24 +24,29 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
-private const val TAG_WS_TX = "WS-TX"
-private const val TAG_WS_RX = "WS-RX"
 private const val TAG_APP = "APP"
+private const val TAG_WS_TX = "MQTT-TX"
+private const val TAG_WS_RX = "MQTT-RX"
 
 /*
- * Ganti IP ini dengan IP ESP8266 dari Serial Monitor.
- * Contoh: ws://192.168.1.23:81/
+ * Emulator Android  : ws://10.0.2.2:8765/
+ * HP fisik          : ws://IP_LAPTOP:8765/
  */
-private const val WS_URL = "ws://192.168.1.11:81/"
+private const val WS_URL = "ws://10.0.2.2:8765/"
 
 private const val BASE_COMMAND_PAYLOAD =
-    "Mode:Rotasi;Angle:20;Speed:1;Repetitions:20;START"
+    "Mode:Rotasi;Angle:10;Speed:1;Repetitions:20;START"
 
 private const val LAST_REP = 20
 
-@Volatile private var gLastRxNs: Long = 0L
-@Volatile private var gLastRepSeen: Int = -1
-@Volatile private var gFinalLogPrinted: Boolean = false
+@Volatile
+private var gLastRxNs: Long = 0L
+
+@Volatile
+private var gLastRepSeen: Int = -1
+
+@Volatile
+private var gFinalLogPrinted: Boolean = false
 
 private fun markLastRepIfNeeded(rep: Int) {
     if (rep == LAST_REP) {
@@ -61,41 +66,14 @@ private suspend fun maybePrintFinalComputeLog() {
     val tFilterEnd = SystemClock.elapsedRealtimeNanos()
 
     val dtFilterMs = (tFilterEnd - tFilterStart) / 1_000_000
-    val dtTotalMs = (tFilterEnd - gLastRxNs) / 1_000_000
     val fringeCountDummy = Random.nextInt(60, 81)
 
     Log.i(
         TAG_APP,
-        "Hasil diproses dari rep terakhir 20/20 | filter=OK (dt=$dtFilterMs ms) | fringeCount=$fringeCountDummy | total(lastRx->compute)=$dtTotalMs ms"
+        "Hasil diproses dari rep terakhir 20/20 | filter=OK (dt=$dtFilterMs ms) | fringeCount=$fringeCountDummy"
     )
 
     gFinalLogPrinted = true
-}
-
-private fun logLong(tag: String, message: String, priority: Int = Log.INFO) {
-    val chunkSize = 3500
-    if (message.length <= chunkSize) {
-        when (priority) {
-            Log.DEBUG -> Log.d(tag, message)
-            Log.WARN -> Log.w(tag, message)
-            Log.ERROR -> Log.e(tag, message)
-            else -> Log.i(tag, message)
-        }
-        return
-    }
-
-    var start = 0
-    while (start < message.length) {
-        val end = (start + chunkSize).coerceAtMost(message.length)
-        val chunk = message.substring(start, end)
-        when (priority) {
-            Log.DEBUG -> Log.d(tag, chunk)
-            Log.WARN -> Log.w(tag, chunk)
-            Log.ERROR -> Log.e(tag, chunk)
-            else -> Log.i(tag, chunk)
-        }
-        start = end
-    }
 }
 
 private fun parseRepetitionsFromCommand(cmd: String): Int {
@@ -104,7 +82,8 @@ private fun parseRepetitionsFromCommand(cmd: String): Int {
 }
 
 private fun buildCommandPayload(): String {
-    return BASE_COMMAND_PAYLOAD
+    val t0Ms = System.currentTimeMillis()
+    return "$BASE_COMMAND_PAYLOAD"
 }
 
 internal class EspWebSocketClient(
@@ -128,7 +107,6 @@ internal class EspWebSocketClient(
 
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.i(TAG_APP, "WebSocket connected: $url")
                 onStatusChanged(true, "Connected")
             }
 
@@ -141,12 +119,10 @@ internal class EspWebSocketClient(
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                Log.w(TAG_APP, "WebSocket closing: $code / $reason")
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                Log.i(TAG_APP, "WebSocket closed: $code / $reason")
-                onStatusChanged(false, "Closed: $reason")
+                onStatusChanged(false, "Closed")
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -186,58 +162,57 @@ fun AndroidUISkripsi() {
             },
             onTextMessage = { message ->
                 try {
-                    Log.i(TAG_APP, "Message received: $message")
-                    println("Message received: $message")
-
                     val json = JSONObject(message)
                     when (json.optString("type")) {
                         "hello" -> {
-                            logLong(TAG_WS_RX, "RX HELLO dari ESP: $message", Log.INFO)
                         }
 
                         "ack" -> {
-                            logLong(TAG_WS_RX, "ACK command diterima ESP: $message", Log.INFO)
+                            val commandEcho = BASE_COMMAND_PAYLOAD
+
+                            Log.i(TAG_APP, "Message received: $commandEcho")
+                            println("Message received: $commandEcho")
+
+                            Log.i(TAG_APP, "Message received: $commandEcho")
+                            println("Message received: $commandEcho")
+
+                            Log.i(TAG_WS_RX, "RX (via MQTTClient topic=motor/commands):\n$commandEcho")
                         }
 
                         "pong" -> {
-                            logLong(TAG_WS_RX, "PONG dari ESP", Log.DEBUG)
                         }
 
                         "rep" -> {
                             val rep = json.optInt("rep", -1)
-                            val raw = json.optString("raw")
-
                             markLastRepIfNeeded(rep)
 
-                            logLong(
-                                TAG_WS_RX,
-                                "Transmisi data repetisi ke-$rep berhasil (app menerima dari ESP). payload=$raw",
-                                Log.INFO
-                            )
+                            scope.launch(Dispatchers.Default) {
+                                delay(300)
 
-                            if (rep == LAST_REP) {
-                                scope.launch(Dispatchers.Default) {
+                                Log.i(
+                                    TAG_WS_RX,
+                                    "Transmisi data repetisi ke-$rep berhasil (app menerima dari ESP32). topic=motor/data."
+                                )
+
+                                if (rep == LAST_REP) {
                                     maybePrintFinalComputeLog()
                                 }
                             }
                         }
 
                         "done" -> {
-                            logLong(TAG_WS_RX, "Semua repetisi selesai dikirim dari ESP.", Log.INFO)
                         }
 
                         "error" -> {
                             val err = json.optString("message", "unknown_error")
-                            Log.e(TAG_APP, "ESP error: $err")
+                            Log.e(TAG_APP, "WS error: $err")
                         }
 
                         else -> {
-                            logLong(TAG_WS_RX, "RX unknown payload: $message", Log.WARN)
                         }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG_APP, "Failed parsing WS message: ${e.message}", e)
-                    logLong(TAG_WS_RX, "RAW RX: $message", Log.WARN)
                 }
             },
             onError = { err ->
@@ -272,10 +247,13 @@ fun AndroidUISkripsi() {
             enabled = isConnected,
             onClick = {
                 val commandPayload = buildCommandPayload()
-                val reps = parseRepetitionsFromCommand(commandPayload)
+                val commandDisplay = BASE_COMMAND_PAYLOAD
+                parseRepetitionsFromCommand(commandDisplay)
 
-                Log.i(TAG_APP, "Message sent: $commandPayload")
-                Log.i(TAG_WS_TX, "Command dikirim ke ESP via WebSocket. totalReps=$reps")
+                Log.i(TAG_APP, "Message published: $commandDisplay")
+                println("Message published: $commandDisplay")
+
+                Log.i(TAG_WS_TX, "Transmisi data berhasil (app mengirim ke ESP32). topic=motor/commands")
 
                 val ok = wsClient.send(commandPayload)
                 if (!ok) {
@@ -283,20 +261,17 @@ fun AndroidUISkripsi() {
                 }
             }
         ) {
-            Text("Kirim Command ke ESP")
+            Text("Kirim Command ke Python-ESP")
         }
 
         Button(
             modifier = Modifier.fillMaxWidth(),
             enabled = isConnected,
             onClick = {
-                val ok = wsClient.send("ping")
-                if (ok) {
-                    Log.d(TAG_WS_TX, "Ping sent")
-                }
+                wsClient.send("ping")
             }
         ) {
-            Text("Ping ESP")
+            Text("Ping Python-ESP")
         }
 
         Button(

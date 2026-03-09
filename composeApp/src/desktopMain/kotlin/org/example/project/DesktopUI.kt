@@ -335,7 +335,7 @@ private class IntRingBuffer(private val capacity: Int) {
     private val data = IntArray(capacity)
     private var head = 0
     private var size = 0
-    private var startSeq = 0L // absolute seq number of the oldest element
+    private var startSeq = 0L
 
     fun append(v: Int) {
         data[head] = v
@@ -343,13 +343,12 @@ private class IntRingBuffer(private val capacity: Int) {
         if (size < capacity) {
             size++
         } else {
-            startSeq++ // overwrite oldest
+            startSeq++
         }
     }
 
     fun oldestSeq(): Long = startSeq
     fun newestSeqExclusive(): Long = startSeq + size
-    fun currentSize(): Int = size
 
     private fun getBySeq(seq: Long): Int {
         val idx = (seq - startSeq).toInt()
@@ -568,17 +567,14 @@ fun DesktopUI() {
     val sensorMessagesList = remember { mutableStateListOf<String>() }
     var showAlertDialog by remember { mutableStateOf(false) }
 
-    // NEW: scope untuk call suspend dari onClick
     val scope = rememberCoroutineScope()
 
-    // ===== Filter UI states (PENDING / preview) =====
     var selectedFilter by remember { mutableStateOf("SG") }
     var sgWindow by remember { mutableStateOf(7) }
     var sgOrder by remember { mutableStateOf(2) }
     var kalmanQ by remember { mutableStateOf(0.01f) }
     var kalmanR by remember { mutableStateOf(1.0f) }
 
-    // ===== Filter APPLIED states (yang dipakai pipeline) =====
     var appliedFilter by remember { mutableStateOf(selectedFilter) }
     var appliedSgWindow by remember { mutableStateOf(sgWindow) }
     var appliedSgOrder by remember { mutableStateOf(sgOrder) }
@@ -590,7 +586,9 @@ fun DesktopUI() {
     val filters = listOf("SG", "Kalman")
 
     val runEpoch = remember { AtomicLong(0L) }
-    val mqttQueue = remember { Channel<Pair<Long, String>>(capacity = Channel.BUFFERED) }
+
+    // epoch, topic, message
+    val mqttQueue = remember { Channel<Triple<Long, String, String>>(capacity = Channel.BUFFERED) }
 
     val RAW_CAP = 200_000
     val FILT_CAP = 200_000
@@ -617,7 +615,6 @@ fun DesktopUI() {
     var savedForThisRun by remember { mutableStateOf(false) }
     var runDone by remember { mutableStateOf(false) }
 
-    // NEW: biar tombol Save disable saat proses save berlangsung
     var savingCsv by remember { mutableStateOf(false) }
 
     LaunchedEffect(selectedFilter, sgWindow, sgOrder, kalmanQ, kalmanR) {
@@ -664,33 +661,41 @@ fun DesktopUI() {
     }
 
     LaunchedEffect(Unit) {
-        MQTTClient.onMessageReceived = { message ->
-            mqttQueue.trySend(runEpoch.get() to message)
+        MQTTClient.onMessageReceived = { topic, message ->
+            mqttQueue.trySend(Triple(runEpoch.get(), topic, message))
         }
     }
 
     LaunchedEffect(Unit) {
         while (isActive) {
-            val (epoch, message) = mqttQueue.receive()
+            val (epoch, topic, message) = mqttQueue.receive()
             if (epoch != runEpoch.get()) continue
 
-            val lines = message.lines()
+            if (topic == MQTTConfig.topicStatus) {
+                val status = message.trim().removeSurrounding("\"").trim()
+                sensorMessagesList.add("[STATUS] $status")
+                if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
 
-            var doneSeen = false
+                if (status == "DONE") {
+                    runDone = true
+                    sensorMessagesList.add("DONE received → ready to save CSV")
+                    if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+                }
+                continue
+            }
+
+            if (topic != MQTTConfig.topicData) {
+                sensorMessagesList.add("[IGNORED:$topic] $message")
+                if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+                continue
+            }
+
+            val lines = message.lines()
             var appendedAny = false
 
             for (rawLine in lines) {
                 val lineNorm = rawLine.trim().removeSurrounding("\"").trim()
                 if (lineNorm.isEmpty()) continue
-
-                if (lineNorm == "DONE") {
-                    doneSeen = true
-                    continue
-                }
-
-                if (lineNorm.contains("Mode:") && lineNorm.contains("START")) {
-                    continue
-                }
 
                 val parts = lineNorm.split(":", limit = 2)
                 val channel = parts.getOrNull(0)?.trim()?.toIntOrNull()
@@ -720,12 +725,6 @@ fun DesktopUI() {
             }
 
             if (appendedAny) uiTick++
-
-            if (doneSeen) {
-                runDone = true
-                sensorMessagesList.add("DONE received → ready to save CSV")
-                if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-            }
         }
     }
 
@@ -802,7 +801,6 @@ fun DesktopUI() {
         }
     }
 
-    // =================== REVISI: PEAK COUNT -> ZERO CROSSING ===================
     val fringeCountByRep by remember(procTick) {
         derivedStateOf {
             val reps = filteredMapForPlot.keys.sorted()
@@ -819,10 +817,6 @@ fun DesktopUI() {
             }
         }
     }
-    // ==========================================================================
-
-    val latestRep by remember { derivedStateOf { fringeCountByRep.keys.maxOrNull() } }
-    val latestFringeCount by remember { derivedStateOf { latestRep?.let { fringeCountByRep[it] } ?: 0 } }
 
     Column(
         modifier = Modifier
@@ -957,7 +951,6 @@ fun DesktopUI() {
                             }
                         }
 
-                        /* =============== Filter Settings Card =============== */
                         Card(
                             modifier = Modifier
                                 .weight(1f)
@@ -1089,7 +1082,6 @@ fun DesktopUI() {
                                         fontWeight = FontWeight.SemiBold,
                                         color = PremiumTokens.Text
                                     )
-
                                 }
 
                                 Spacer(Modifier.height(8.dp))
@@ -1157,8 +1149,6 @@ fun DesktopUI() {
                             }
                         }
                     }
-
-                    /* =============== Settings & Start Cards =============== */
 
                     if (showAlertDialog) {
                         AlertDialog(
@@ -1272,12 +1262,10 @@ fun DesktopUI() {
                         elevation = PremiumTokens.cardElevation()
                     ) {
                         Column(Modifier.padding(12.dp), horizontalAlignment = Alignment.End) {
-
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-
                                 Button(
                                     onClick = {
                                         if (angle.toIntOrNull() == null && angle.isNotEmpty() ||
@@ -1304,9 +1292,14 @@ fun DesktopUI() {
                                             procTick++
 
                                             showPlot = true
+
                                             val cmd =
                                                 "Mode:$mode;${if (mode == "Rotasi") "Angle" else "Distance"}:$angle;" +
                                                         "Speed:$speed;Repetitions:$repetitions;START"
+
+                                            sensorMessagesList.add("[CMD] $cmd")
+                                            if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+
                                             MQTTClient.publish(cmd)
                                         }
                                     },
@@ -1319,7 +1312,7 @@ fun DesktopUI() {
                                     shape = RoundedCornerShape(12.dp)
                                 ) { Text("Start", fontWeight = FontWeight.SemiBold) }
 
-                                val saveGreen = Color(0xFF16A34A)          // green-600
+                                val saveGreen = Color(0xFF16A34A)
                                 val saveGreenDisabled = Color(0xFF16A34A).copy(alpha = 0.45f)
 
                                 Button(
@@ -1371,7 +1364,7 @@ fun DesktopUI() {
                                         disabledContainerColor = saveGreenDisabled,
                                         disabledContentColor = Color.White.copy(alpha = 0.7f)
                                     ),
-                                    elevation = PremiumTokens.buttonElevation(),   // biar “tone” sama seperti Start
+                                    elevation = PremiumTokens.buttonElevation(),
                                     shape = RoundedCornerShape(12.dp)
                                 ) {
                                     Text(if (savingCsv) "Saving..." else "Save CSV", fontWeight = FontWeight.SemiBold)
@@ -1463,19 +1456,12 @@ private fun detectPeaksDouble(values: List<Double>): List<Int> {
     return peaks
 }
 
-/* ======================== REVISI: ZERO CROSSING FRINGE COUNT ============================ */
-/**
- * Zero-crossing dengan detrend (baseline moving average) + smoothing ringan + hysteresis (deadband).
- * Menghitung UP-crossing (dari bawah ke atas), sehingga 1 periode ~ 1 hitungan.
- *
- * Tidak memakai threshold tinggi puncak, jadi puncak kecil tetap terhitung selama masih menyeberang baseline.
- */
 private fun countFringesFromZeroCrossingDouble(
     values: List<Double>,
-    baselineWindow: Int = 201,    // harus lebih besar dari periode fringe
-    smoothWindow: Int = 9,        // smoothing ringan anti noise
-    epsFraction: Double = 0.12,   // deadband relatif dari skala sinyal (median abs)
-    minEps: Double = 0.5          // deadband minimum (anti jitter)
+    baselineWindow: Int = 201,
+    smoothWindow: Int = 9,
+    epsFraction: Double = 0.12,
+    minEps: Double = 0.5
 ): Int {
     if (values.size < 5) return 0
 
@@ -1485,11 +1471,9 @@ private fun countFringesFromZeroCrossingDouble(
     val smooth = movingAverageCentered(detrended.asList(), smoothWindow)
     val y = DoubleArray(values.size) { i -> smooth[i] }
 
-    // skala robust: median(|y|)
     val absMed = medianAbs(y)
     val eps = max(minEps, epsFraction * absMed)
 
-    // Hysteresis state machine: -1 below, +1 above, 0 unknown
     var state = 0
     var upCrossings = 0
 
@@ -1501,7 +1485,6 @@ private fun countFringesFromZeroCrossingDouble(
             }
             v < -eps -> state = -1
             else -> {
-                // within deadband: keep state
             }
         }
     }
@@ -1509,10 +1492,6 @@ private fun countFringesFromZeroCrossingDouble(
     return upCrossings.coerceAtLeast(0)
 }
 
-/**
- * Moving average "centered" dengan edge clamp (replicate edge).
- * Window dipaksa ganjil.
- */
 private fun movingAverageCentered(values: List<Double>, window: Int): DoubleArray {
     val n = values.size
     if (n == 0) return DoubleArray(0)
@@ -1529,7 +1508,6 @@ private fun movingAverageCentered(values: List<Double>, window: Int): DoubleArra
     var sum = 0.0
     val count = w
 
-    // init i=0 window centered at 0 => indices [-half..+half] (clamped)
     for (k in -half..half) sum += getClamped(k)
     out[0] = sum / count
 
@@ -1549,9 +1527,8 @@ private fun medianAbs(x: DoubleArray): Double {
     val mid = a.size / 2
     return if (a.size % 2 == 1) a[mid] else (a[mid - 1] + a[mid]) * 0.5
 }
-/* ======================== END REVISI ============================ */
 
-/* ======================== FILTER LOGIC (KEPT AS-IS) ============================ */
+/* ======================== FILTER LOGIC ============================ */
 
 fun applyFilter(
     values: List<Int>,
