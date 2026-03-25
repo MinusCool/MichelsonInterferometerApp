@@ -1,17 +1,11 @@
 package org.example.project
 
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.HorizontalScrollbar
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.Orientation
-import androidx.compose.foundation.gestures.draggable
-import androidx.compose.foundation.gestures.rememberDraggableState
-import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.rememberScrollbarAdapter
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -24,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
@@ -31,15 +26,70 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.*
 import java.io.File
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.Base64
 import java.util.concurrent.atomic.AtomicLong
+import org.jetbrains.skia.Image as SkiaImage
+
+
+private fun detectFilteredPeakIndicesGlobal(
+    values: List<Double>,
+    minPeakDistance: Int = 3,
+    relHeight: Double = 0.15,
+    relProminence: Double = 0.08,
+    prominenceWindow: Int = 12
+): IntArray {
+    if (values.size < 3) return IntArray(0)
+
+    val minV = values.minOrNull() ?: return IntArray(0)
+    val maxV = values.maxOrNull() ?: return IntArray(0)
+    val span = maxV - minV
+    if (span <= 1e-12) return IntArray(0)
+
+    val peakThreshold = minV + (relHeight * span)
+    val prominenceThreshold = max(span * relProminence, 1e-9)
+    val distance = max(1, minPeakDistance)
+    val window = max(distance + 1, prominenceWindow)
+
+    val peaks = ArrayList<Int>()
+    var lastPeak = -distance
+
+    for (i in 1 until values.lastIndex) {
+        val current = values[i]
+        if (current < peakThreshold) continue
+        if (!(current > values[i - 1] && current >= values[i + 1])) continue
+        if (i - lastPeak < distance) continue
+
+        val leftStart = max(0, i - window)
+        val rightEndExclusive = min(values.size, i + window + 1)
+
+        var leftMin = current
+        for (j in leftStart until i) leftMin = min(leftMin, values[j])
+
+        var rightMin = current
+        for (j in (i + 1) until rightEndExclusive) rightMin = min(rightMin, values[j])
+
+        val prominence = current - max(leftMin, rightMin)
+        if (prominence < prominenceThreshold) continue
+
+        peaks.add(i)
+        lastPeak = i
+    }
+
+    return peaks.toIntArray()
+}
+
+private fun countFilteredPeaksGlobal(values: List<Double>): Int =
+    detectFilteredPeakIndicesGlobal(values).size
 
 /* ======================== PREMIUM UI TOKENS ============================ */
 
@@ -87,7 +137,10 @@ private object PremiumTokens {
 @Composable
 fun HeaderSection(logo: Painter) {
     Box(
-        modifier = Modifier.fillMaxWidth().height(160.dp).aspectRatio(16f / 9f)
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(160.dp)
+            .aspectRatio(16f / 9f)
     ) {
         Image(
             painter = logo,
@@ -111,6 +164,7 @@ fun HeaderSection(logo: Painter) {
 fun StatusIndicator(connected: Boolean, onToggle: () -> Unit) {
     val text = if (connected) "Connected" else "Disconnected"
     val color = if (connected) PremiumTokens.Primary else PremiumTokens.Danger
+
     Button(
         onClick = onToggle,
         colors = ButtonDefaults.buttonColors(
@@ -120,7 +174,7 @@ fun StatusIndicator(connected: Boolean, onToggle: () -> Unit) {
             disabledContentColor = Color.White.copy(alpha = 0.7f)
         ),
         elevation = PremiumTokens.buttonElevation(),
-        shape = RoundedCornerShape(16.dp),
+        shape = RoundedCornerShape(14.dp),
         modifier = Modifier.fillMaxWidth()
     ) {
         Text(text, fontWeight = FontWeight.SemiBold, letterSpacing = 0.2.sp)
@@ -129,7 +183,10 @@ fun StatusIndicator(connected: Boolean, onToggle: () -> Unit) {
 
 @Composable
 fun ModeSelectionChipGroup(mode: String, onModeChange: (String) -> Unit) {
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
         Button(
             onClick = { onModeChange("Linear") },
             modifier = Modifier.weight(1f),
@@ -183,377 +240,432 @@ fun ModeSelectionChipGroup(mode: String, onModeChange: (String) -> Unit) {
 /* ======================== PLOT SECTION ============================ */
 
 @Composable
-fun DataPlotSection(
-    channelMap: Map<Int, List<Int>>,
-    filteredMap: Map<Int, List<Double>>
+private fun PlotViewportControls(
+    zoomScale: Float,
+    onZoomChange: (Float) -> Unit,
+    canPanLeft: Boolean,
+    canPanRight: Boolean,
+    onPanLeft: () -> Unit,
+    onPanRight: () -> Unit,
+    modifier: Modifier = Modifier,
+    minZoom: Float = 1f,
+    maxZoom: Float = 12f,
+    step: Float = 1.25f
 ) {
-    val N_VISIBLE = 100
-    val vScroll = rememberScrollState()
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = "Zoom ${(zoomScale * 100f).roundToInt()}%",
+            color = PremiumTokens.TextMuted,
+            fontSize = 12.sp
+        )
 
-    Box(modifier = Modifier.height(320.dp).verticalScroll(vScroll)) {
-        Column(modifier = Modifier.fillMaxWidth()) {
-            val sortedKeys = channelMap.keys.sorted()
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(
+                onClick = onPanLeft,
+                enabled = canPanLeft,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 5.dp),
+                modifier = Modifier.height(38.dp)
+            ) { Text("←", fontSize = 12.sp) }
+            Spacer(Modifier.width(6.dp))
+            OutlinedButton(
+                onClick = { onZoomChange((zoomScale / step).coerceAtLeast(minZoom)) },
+                enabled = zoomScale > minZoom,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 5.dp),
+                modifier = Modifier.height(38.dp)
+            ) { Text("-", fontSize = 13.sp) }
+            Spacer(Modifier.width(6.dp))
+            OutlinedButton(
+                onClick = { onZoomChange(1f) },
+                enabled = kotlin.math.abs(zoomScale - 1f) > 0.001f,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 5.dp),
+                modifier = Modifier.height(38.dp)
+            ) { Text("Reset", fontSize = 13.sp) }
+            Spacer(Modifier.width(6.dp))
+            OutlinedButton(
+                onClick = { onZoomChange((zoomScale * step).coerceAtMost(maxZoom)) },
+                enabled = zoomScale < maxZoom,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 5.dp),
+                modifier = Modifier.height(38.dp)
+            ) { Text("+", fontSize = 13.sp) }
+            Spacer(Modifier.width(6.dp))
+            OutlinedButton(
+                onClick = onPanRight,
+                enabled = canPanRight,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 5.dp),
+                modifier = Modifier.height(38.dp)
+            ) { Text("→", fontSize = 13.sp) }
+        }
+    }
+}
 
-            if (sortedKeys.isEmpty()) {
-                Text(
-                    "No data to display. Start the process to receive MQTT data.",
-                    modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 80.dp),
-                    color = PremiumTokens.TextMuted,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Medium
+private data class PlotWindow(
+    val start: Int,
+    val endExclusive: Int,
+    val visibleCount: Int,
+    val totalCount: Int
+)
+
+private fun computePlotWindow(totalCount: Int, zoomScale: Float, panFraction: Float, minVisible: Int): PlotWindow {
+    val safeTotal = totalCount.coerceAtLeast(1)
+    val safeZoom = zoomScale.coerceAtLeast(1f)
+    val visible = (safeTotal / safeZoom).roundToInt().coerceIn(minVisible.coerceAtMost(safeTotal), safeTotal)
+    val maxStart = (safeTotal - visible).coerceAtLeast(0)
+    val start = (maxStart * panFraction.coerceIn(0f, 1f)).roundToInt().coerceIn(0, maxStart)
+    return PlotWindow(start = start, endExclusive = (start + visible).coerceAtMost(safeTotal), visibleCount = visible, totalCount = safeTotal)
+}
+
+private fun shiftPanFraction(current: Float, zoomScale: Float, totalCount: Int, direction: Int, minVisible: Int): Float {
+    val window = computePlotWindow(totalCount, zoomScale, current, minVisible)
+    if (window.totalCount <= window.visibleCount) return 0f
+    val maxStart = (window.totalCount - window.visibleCount).toFloat().coerceAtLeast(1f)
+    val step = (window.visibleCount * 0.20f).coerceAtLeast(1f)
+    val currentStart = window.start.toFloat()
+    val nextStart = (currentStart + direction * step).coerceIn(0f, maxStart)
+    return (nextStart / maxStart).coerceIn(0f, 1f)
+}
+
+private fun decodePlotImageOrNull(imageBase64: String): androidx.compose.ui.graphics.ImageBitmap? {
+    if (imageBase64.isBlank()) return null
+    return runCatching {
+        val bytes = Base64.getDecoder().decode(imageBase64)
+        SkiaImage.makeFromEncoded(bytes).asImageBitmap()
+    }.getOrNull()
+}
+
+private data class UiDialogInfo(
+    val title: String,
+    val message: String
+)
+
+@Composable
+private fun RepetitionSelector(
+    repetitions: List<Int>,
+    selectedRep: Int?,
+    onSelected: (Int) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val selectedIndex = repetitions.indexOf(selectedRep).coerceAtLeast(0)
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        OutlinedButton(
+            onClick = { if (selectedIndex > 0) onSelected(repetitions[selectedIndex - 1]) },
+            enabled = repetitions.isNotEmpty() && selectedIndex > 0,
+            modifier = Modifier.width(54.dp).height(32.dp),
+            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+        ) { Text("Prev", fontSize = 11.sp) }
+
+        BoxWithConstraints(modifier = Modifier.weight(1f)) {
+            val anchorWidth = maxWidth
+
+            OutlinedCard(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = repetitions.isNotEmpty()) { expanded = true },
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.outlinedCardColors(containerColor = PremiumTokens.Surface)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 7.dp, horizontal = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = selectedRep?.let { "Repetition $it" } ?: "No repetition",
+                        color = PremiumTokens.Text,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 13.sp
+                    )
+                }
+            }
+
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier.width(anchorWidth),
+                shape = RoundedCornerShape(16.dp),
+                containerColor = PremiumTokens.Surface,
+                tonalElevation = 0.dp,
+                shadowElevation = 12.dp,
+                border = androidx.compose.foundation.BorderStroke(1.dp, PremiumTokens.Border)
+            ) {
+                repetitions.forEach { rep ->
+                    DropdownMenuItem(
+                        text = {
+                            Box(
+                                modifier = Modifier.fillMaxWidth(),
+                                contentAlignment = Alignment.CenterStart
+                            ) {
+                                Text("Repetition $rep")
+                            }
+                        },
+                        colors = MenuDefaults.itemColors(
+                            textColor = PremiumTokens.Text,
+                            leadingIconColor = PremiumTokens.Primary,
+                            trailingIconColor = PremiumTokens.Primary,
+                            disabledTextColor = PremiumTokens.TextMuted
+                        ),
+                        onClick = {
+                            expanded = false
+                            onSelected(rep)
+                        }
+                    )
+                }
+            }
+        }
+
+        OutlinedButton(
+            onClick = { if (selectedIndex in 0 until repetitions.lastIndex) onSelected(repetitions[selectedIndex + 1]) },
+            enabled = repetitions.isNotEmpty() && selectedIndex in 0 until repetitions.lastIndex,
+            modifier = Modifier.width(54.dp).height(32.dp),
+            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+        ) { Text("Next", fontSize = 11.sp) }
+    }
+}
+
+@Composable
+private fun PythonSignalPlotSection(
+    processor: ProcessorClient,
+    paramsVersion: Long,
+    channel: Int?,
+    rawSnapshot: List<Int>,
+    filteredSnapshot: List<Double>
+) {
+    if (channel == null) {
+        Text("No repetition data yet.", color = PremiumTokens.TextMuted)
+        return
+    }
+
+    var zoomScale by remember(channel, rawSnapshot.size, filteredSnapshot.size) { mutableStateOf(1f) }
+    var panFraction by remember(channel, rawSnapshot.size, filteredSnapshot.size) { mutableStateOf(0f) }
+
+    val raw = remember(rawSnapshot) { rawSnapshot.toIntArray() }
+    val filtered = remember(filteredSnapshot) { filteredSnapshot.toDoubleArray() }
+    val totalCount = max(raw.size, filtered.size)
+    if (totalCount < 2) {
+        Text("Signal data not enough.", color = PremiumTokens.TextMuted)
+        return
+    }
+
+    val window = computePlotWindow(totalCount, zoomScale, panFraction, minVisible = 64)
+    val imageBase64 by produceState(
+        initialValue = "",
+        channel,
+        paramsVersion,
+        window.start,
+        window.endExclusive,
+        raw.size,
+        filtered.size
+    ) {
+        value = withContext(Dispatchers.IO) {
+            processor.renderPlot(
+                channel = channel,
+                paramsVersion = paramsVersion,
+                plotKind = PlotKind.Signal,
+                raw = raw,
+                filtered = filtered,
+                fftFreq = doubleArrayOf(),
+                fftSpec = doubleArrayOf(),
+                viewStartIndex = window.start,
+                viewEndExclusive = window.endExclusive
+            ).imageBase64
+        }
+    }
+    val bitmap = remember(imageBase64) { decodePlotImageOrNull(imageBase64) }
+    val visibleRaw = remember(raw, window.start, window.endExclusive) {
+        val start = window.start.coerceIn(0, raw.size)
+        val end = window.endExclusive.coerceIn(start, raw.size)
+        raw.copyOfRange(start, end)
+    }
+    val visibleFiltered = remember(filtered, window.start, window.endExclusive) {
+        val start = window.start.coerceIn(0, filtered.size)
+        val end = window.endExclusive.coerceIn(start, filtered.size)
+        filtered.copyOfRange(start, end)
+    }
+    val visibleValues = remember(visibleRaw, visibleFiltered) {
+        buildList<Double> {
+            visibleRaw.forEach { add(it.toDouble()) }
+            visibleFiltered.forEach { add(it) }
+        }
+    }
+    val minValue = visibleValues.minOrNull()
+    val maxValue = visibleValues.maxOrNull()
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        PlotViewportControls(
+            zoomScale = zoomScale,
+            onZoomChange = {
+                zoomScale = it
+                panFraction = panFraction.coerceIn(0f, 1f)
+            },
+            canPanLeft = window.start > 0,
+            canPanRight = window.endExclusive < window.totalCount,
+            onPanLeft = { panFraction = shiftPanFraction(panFraction, zoomScale, totalCount, -1, 64) },
+            onPanRight = { panFraction = shiftPanFraction(panFraction, zoomScale, totalCount, 1, 64) }
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Signal Plot - Repetition $channel  •  sample ${window.start}..${window.endExclusive - 1}  •  min=${minValue?.let { "%.3f".format(it) } ?: "-"}  •  max=${maxValue?.let { "%.3f".format(it) } ?: "-"}",
+            fontSize = 12.sp,
+            color = PremiumTokens.TextMuted
+        )
+        Spacer(Modifier.height(4.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .background(Color.White, RoundedCornerShape(12.dp))
+                .padding(2.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            if (bitmap != null) {
+                Image(
+                    bitmap = bitmap,
+                    contentDescription = "Signal Plot",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit
                 )
             } else {
-                for (keyVal in sortedKeys) {
-                    val values = channelMap[keyVal] ?: emptyList()
-                    val rawSnapshot = values.toList()
-                    val filteredSnapshot = (filteredMap[keyVal] ?: emptyList()).toList()
-
-                    Text(
-                        "samples=${rawSnapshot.size}  min=${rawSnapshot.minOrNull()}  max=${rawSnapshot.maxOrNull()}",
-                        fontSize = 12.sp,
-                        color = PremiumTokens.TextMuted
-                    )
-                    Text(
-                        "Repetition $keyVal",
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = PremiumTokens.Text
-                    )
-
-                    key(keyVal) {
-                        val hScroll = rememberScrollState()
-                        val totalPoints = max(rawSnapshot.size, filteredSnapshot.size).coerceAtLeast(2)
-
-                        BoxWithConstraints(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(110.dp)
-                        ) {
-                            val viewportWidthDp = this.maxWidth
-                            val dpPerSample = (viewportWidthDp / (N_VISIBLE - 1).coerceAtLeast(1))
-                            val plotWidthDp = (dpPerSample * (totalPoints - 1)).coerceAtLeast(viewportWidthDp)
-
-                            LaunchedEffect(totalPoints, plotWidthDp) {
-                                hScroll.scrollTo(hScroll.maxValue)
-                            }
-
-                            Box(modifier = Modifier.fillMaxSize()) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .horizontalScroll(hScroll)
-                                        .draggable(
-                                            orientation = Orientation.Horizontal,
-                                            state = rememberDraggableState { delta ->
-                                                hScroll.dispatchRawDelta(-delta)
-                                            }
-                                        )
-                                ) {
-                                    Canvas(
-                                        modifier = Modifier
-                                            .width(plotWidthDp)
-                                            .fillMaxHeight()
-                                            .padding(bottom = 12.dp)
-                                    ) {
-                                        val stepX = dpPerSample.toPx()
-
-                                        val dataForScale =
-                                            if (filteredSnapshot.isNotEmpty())
-                                                (rawSnapshot.map { it.toDouble() } + filteredSnapshot)
-                                            else rawSnapshot.map { it.toDouble() }
-
-                                        if (dataForScale.size >= 2) {
-                                            val maxVal = dataForScale.maxOrNull()?.toFloat() ?: 100f
-                                            val minVal = dataForScale.minOrNull()?.toFloat() ?: 0f
-                                            val rangeVal = max(1e-6f, maxVal - minVal)
-                                            val scaleY = size.height / rangeVal
-
-                                            val grid = PremiumTokens.Border.copy(alpha = 0.55f)
-                                            val numHorizontalLines = 5
-                                            repeat(numHorizontalLines) {
-                                                val y = it * (size.height / (numHorizontalLines - 1))
-                                                drawLine(grid, Offset(0f, y), Offset(size.width, y), 1f)
-                                            }
-                                            val numVerticalLines = 12
-                                            val stepXGrid = size.width / (numVerticalLines - 1).coerceAtLeast(1)
-                                            repeat(numVerticalLines) {
-                                                val x = it * stepXGrid
-                                                drawLine(grid, Offset(x, 0f), Offset(x, size.height), 1f)
-                                            }
-
-                                            if (rawSnapshot.size >= 2) {
-                                                for (i in 0 until rawSnapshot.size - 1) {
-                                                    val y1 = size.height - ((rawSnapshot[i].toFloat() - minVal) * scaleY)
-                                                    val y2 = size.height - ((rawSnapshot[i + 1].toFloat() - minVal) * scaleY)
-                                                    drawLine(
-                                                        PremiumTokens.Accent,
-                                                        Offset(i * stepX, y1),
-                                                        Offset((i + 1) * stepX, y2),
-                                                        2f
-                                                    )
-                                                }
-                                            }
-
-                                            if (filteredSnapshot.size >= 2) {
-                                                val gold = Color(0xFFF59E0B)
-                                                for (i in 0 until filteredSnapshot.size - 1) {
-                                                    val y1 = size.height - ((filteredSnapshot[i].toFloat() - minVal) * scaleY)
-                                                    val y2 = size.height - ((filteredSnapshot[i + 1].toFloat() - minVal) * scaleY)
-                                                    drawLine(
-                                                        gold,
-                                                        Offset(i * stepX, y1),
-                                                        Offset((i + 1) * stepX, y2),
-                                                        2f
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                HorizontalScrollbar(
-                                    adapter = rememberScrollbarAdapter(hScroll),
-                                    modifier = Modifier
-                                        .align(Alignment.BottomCenter)
-                                        .fillMaxWidth()
-                                        .height(8.dp)
-                                )
-                            }
-                        }
-                    }
-                }
+                Text("Rendering signal plot...", color = PremiumTokens.TextMuted)
             }
         }
     }
 }
 
-/* ======================== STREAMING BUFFERS + PROCESSOR API ============================ */
+@Composable
+private fun PythonFftPlotSection(
+    processor: ProcessorClient,
+    paramsVersion: Long,
+    channel: Int?,
+    fftFreq: DoubleArray,
+    fftSpec: DoubleArray
+) {
+    if (channel == null) {
+        Text("No FFT data yet.", color = PremiumTokens.TextMuted)
+        return
+    }
 
-private fun Int.floorMod(m: Int): Int = ((this % m) + m) % m
+    var zoomScale by remember(channel, fftFreq.size, fftSpec.size) { mutableStateOf(1f) }
+    var panFraction by remember(channel, fftFreq.size, fftSpec.size) { mutableStateOf(0f) }
 
-private class IntRingBuffer(private val capacity: Int) {
-    private val data = IntArray(capacity)
-    private var head = 0
-    private var size = 0
-    private var startSeq = 0L
+    val totalCount = min(fftFreq.size, fftSpec.size)
+    if (totalCount < 2) {
+        Text("FFT data not enough.", color = PremiumTokens.TextMuted)
+        return
+    }
 
-    fun append(v: Int) {
-        data[head] = v
-        head = (head + 1) % capacity
-        if (size < capacity) {
-            size++
-        } else {
-            startSeq++
+    val window = computePlotWindow(totalCount, zoomScale, panFraction, minVisible = 32)
+    val imageBase64 by produceState(
+        initialValue = "",
+        channel,
+        paramsVersion,
+        window.start,
+        window.endExclusive,
+        fftFreq.size,
+        fftSpec.size
+    ) {
+        value = withContext(Dispatchers.IO) {
+            processor.renderPlot(
+                channel = channel,
+                paramsVersion = paramsVersion,
+                plotKind = PlotKind.Fft,
+                raw = intArrayOf(),
+                filtered = doubleArrayOf(),
+                fftFreq = fftFreq,
+                fftSpec = fftSpec,
+                viewStartIndex = window.start,
+                viewEndExclusive = window.endExclusive
+            ).imageBase64
         }
     }
+    val bitmap = remember(imageBase64) { decodePlotImageOrNull(imageBase64) }
+    val freqStart = fftFreq.getOrNull(window.start) ?: 0.0
+    val freqEnd = fftFreq.getOrNull((window.endExclusive - 1).coerceAtLeast(window.start)) ?: freqStart
 
-    fun oldestSeq(): Long = startSeq
-    fun newestSeqExclusive(): Long = startSeq + size
-
-    private fun getBySeq(seq: Long): Int {
-        val idx = (seq - startSeq).toInt()
-        require(idx in 0 until size) { "seq out of range" }
-        val physical = (head - size + idx).floorMod(capacity)
-        return data[physical]
-    }
-
-    fun readChunk(fromSeq: Long, maxCount: Int): IntArray {
-        val from = max(fromSeq, oldestSeq())
-        val to = min(from + maxCount, newestSeqExclusive())
-        val n = (to - from).toInt().coerceAtLeast(0)
-        val out = IntArray(n)
-        for (i in 0 until n) out[i] = getBySeq(from + i)
-        return out
-    }
-
-    fun snapshotLast(maxPoints: Int): List<Int> {
-        val n = min(size, maxPoints)
-        val start = newestSeqExclusive() - n
-        return List(n) { i -> getBySeq(start + i) }
-    }
-}
-
-private class DoubleRingBuffer(private val capacity: Int) {
-    private val data = DoubleArray(capacity)
-    private var head = 0
-    private var size = 0
-    private var startSeq = 0L
-
-    fun appendAll(values: DoubleArray) {
-        for (v in values) append(v)
-    }
-
-    private fun append(v: Double) {
-        data[head] = v
-        head = (head + 1) % capacity
-        if (size < capacity) size++ else startSeq++
-    }
-
-    private fun getBySeq(seq: Long): Double {
-        val idx = (seq - startSeq).toInt()
-        require(idx in 0 until size) { "seq out of range" }
-        val physical = (head - size + idx).floorMod(capacity)
-        return data[physical]
-    }
-
-    fun snapshotLast(maxPoints: Int): List<Double> {
-        val n = min(size, maxPoints)
-        val start = startSeq + size - n
-        return List(n) { i -> getBySeq(start + i) }
-    }
-
-    fun clear() {
-        head = 0
-        size = 0
-        startSeq = 0L
-    }
-}
-
-data class ProcParams(
-    val version: Long,
-    val type: String,
-    val sgWindow: Int,
-    val sgOrder: Int,
-    val kalmanQ: Double,
-    val kalmanR: Double
-)
-
-data class ProcResponse(
-    val channel: Int,
-    val seqStart: Long,
-    val paramsVersion: Long,
-    val filtered: DoubleArray
-)
-
-interface ProcessorClient {
-    fun process(
-        channel: Int,
-        seqStart: Long,
-        rawTail: IntArray,
-        rawChunk: IntArray,
-        params: ProcParams
-    ): ProcResponse
-}
-
-private class LocalProcessorClient(
-    private val kalmanX: MutableMap<Int, Double>,
-    private val kalmanP: MutableMap<Int, Double>
-) : ProcessorClient {
-
-    override fun process(
-        channel: Int,
-        seqStart: Long,
-        rawTail: IntArray,
-        rawChunk: IntArray,
-        params: ProcParams
-    ): ProcResponse {
-        val out: DoubleArray = when (params.type) {
-            "SG" -> {
-                val combined = ArrayList<Int>(rawTail.size + rawChunk.size)
-                for (v in rawTail) combined.add(v)
-                for (v in rawChunk) combined.add(v)
-
-                val yInt = savitzkyGolayFilterTrue(combined, params.sgWindow, params.sgOrder)
-                val dropped = rawTail.size
-                DoubleArray(rawChunk.size) { i -> yInt[i + dropped].toDouble() }
-            }
-
-            "Kalman" -> {
-                val Q = params.kalmanQ
-                val R = params.kalmanR
-
-                var x: Double = kalmanX[channel] ?: (rawChunk.firstOrNull()?.toDouble() ?: 0.0)
-                var P: Double = kalmanP[channel] ?: 1.0
-
-                val y = DoubleArray(rawChunk.size)
-                for (i in rawChunk.indices) {
-                    val z = rawChunk[i].toDouble()
-                    val xPred = x
-                    val PPred = P + Q
-                    val K = PPred / (PPred + R)
-                    x = xPred + K * (z - xPred)
-                    P = (1.0 - K) * PPred
-                    y[i] = x
-                }
-                kalmanX[channel] = x
-                kalmanP[channel] = P
-                y
-            }
-
-            else -> DoubleArray(rawChunk.size) { i -> rawChunk[i].toDouble() }
-        }
-
-        return ProcResponse(
-            channel = channel,
-            seqStart = seqStart,
-            paramsVersion = params.version,
-            filtered = out
+    Column(modifier = Modifier.fillMaxSize()) {
+        PlotViewportControls(
+            zoomScale = zoomScale,
+            onZoomChange = {
+                zoomScale = it
+                panFraction = panFraction.coerceIn(0f, 1f)
+            },
+            canPanLeft = window.start > 0,
+            canPanRight = window.endExclusive < window.totalCount,
+            onPanLeft = { panFraction = shiftPanFraction(panFraction, zoomScale, totalCount, -1, 32) },
+            onPanRight = { panFraction = shiftPanFraction(panFraction, zoomScale, totalCount, 1, 32) }
         )
-    }
-}
-
-/* ======================== CSV EXPORT (MANUAL ON SAVE) ============================ */
-
-private fun exportCsvSnapshotToExperiments(
-    rawBufByChannel: Map<Int, IntRingBuffer>,
-    filtBufByChannel: Map<Int, DoubleRingBuffer>,
-    rawMax: Int,
-    filtMax: Int
-): File {
-    val dir = File("newest_experiments")
-    dir.mkdirs()
-
-    val ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
-    val outFile = File(dir, "experiment_$ts.csv")
-
-    val sb = StringBuilder()
-    sb.appendLine("channel,index,raw,filtered")
-
-    val channels = (rawBufByChannel.keys + filtBufByChannel.keys).toSortedSet()
-    for (ch in channels) {
-        val raw = rawBufByChannel[ch]?.snapshotLast(rawMax).orEmpty()
-        val filt = filtBufByChannel[ch]?.snapshotLast(filtMax).orEmpty()
-        val n = max(raw.size, filt.size)
-        for (i in 0 until n) {
-            val r = raw.getOrNull(i)
-            val f = filt.getOrNull(i)
-            sb.append(ch).append(',')
-                .append(i).append(',')
-                .append(r?.toString() ?: "").append(',')
-                .append(f?.let { "%.6f".format(it) } ?: "")
-                .appendLine()
-        }
-    }
-
-    outFile.writeText(sb.toString())
-    return outFile
-}
-
-private suspend fun awaitFilterCatchUp(
-    rawBufByChannel: Map<Int, IntRingBuffer>,
-    nextSeqToProcess: Map<Int, Long>,
-    timeoutMs: Long = 3000L,
-    pollMs: Long = 25L
-): Boolean {
-    val start = System.currentTimeMillis()
-    while (System.currentTimeMillis() - start <= timeoutMs) {
-        var allDone = true
-        for (ch in rawBufByChannel.keys) {
-            val raw = rawBufByChannel[ch] ?: continue
-            val need = raw.newestSeqExclusive()
-            val cur = nextSeqToProcess[ch] ?: raw.oldestSeq()
-            if (cur < need) {
-                allDone = false
-                break
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "FFT Plot - Repetition $channel  •  ${"%.1f".format(freqStart)}–${"%.1f".format(freqEnd)} Hz",
+            fontSize = 12.sp,
+            color = PremiumTokens.TextMuted
+        )
+        Spacer(Modifier.height(4.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .background(Color.White, RoundedCornerShape(12.dp))
+                .padding(2.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            if (bitmap != null) {
+                Image(
+                    bitmap = bitmap,
+                    contentDescription = "FFT Plot",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit
+                )
+            } else {
+                Text("Rendering FFT plot...", color = PremiumTokens.TextMuted)
             }
         }
-        if (allDone) return true
-        delay(pollMs)
     }
-    return false
 }
 
 /* ======================== MAIN UI ============================ */
+
+
+@Composable
+private fun SidebarSectionCard(
+    title: String,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = PremiumTokens.CardShape,
+        colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
+        elevation = PremiumTokens.cardElevation()
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggle),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(title, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, color = PremiumTokens.Text)
+                Text(if (expanded) "▾" else "▸", color = PremiumTokens.TextMuted, fontSize = 16.sp)
+            }
+            if (expanded) {
+                Spacer(Modifier.height(10.dp))
+                content()
+            }
+        }
+    }
+}
 
 @Composable
 fun DesktopUI() {
@@ -563,9 +675,15 @@ fun DesktopUI() {
     var speed by remember { mutableStateOf("") }
     var repetitions by remember { mutableStateOf("") }
     var showPlot by remember { mutableStateOf(false) }
+    var showFftPlot by remember { mutableStateOf(false) }
 
     val sensorMessagesList = remember { mutableStateListOf<String>() }
-    var showAlertDialog by remember { mutableStateOf(false) }
+    var dialogInfo by remember { mutableStateOf<UiDialogInfo?>(null) }
+    var systemSetupExpanded by remember { mutableStateOf(true) }
+    var filterExpanded by remember { mutableStateOf(true) }
+    var fftExpanded by remember { mutableStateOf(true) }
+    var fringeExpanded by remember { mutableStateOf(true) }
+    var mqttExpanded by remember { mutableStateOf(true) }
 
     val scope = rememberCoroutineScope()
 
@@ -586,23 +704,35 @@ fun DesktopUI() {
     val filters = listOf("SG", "Kalman")
 
     val runEpoch = remember { AtomicLong(0L) }
-
-    // epoch, topic, message
     val mqttQueue = remember { Channel<Triple<Long, String, String>>(capacity = Channel.BUFFERED) }
 
-    val RAW_CAP = 200_000
-    val FILT_CAP = 200_000
-    val PLOT_MAX_POINTS = 5_000
+    val rawCap = 200_000
+    val filtCap = 200_000
+    val plotMaxPoints = 5_000
+    val analysisLookback = 2048
+
+    val recordDurationSec = 1.0
+    val fftEnabled = true
+    val fftFmin = 5.0
+    val fftFmax = 120.0
+    val fftZeroPadFactor = 8
+    val fftUseAutoBand = true
 
     val rawBufByChannel = remember { mutableStateMapOf<Int, IntRingBuffer>() }
     val filtBufByChannel = remember { mutableStateMapOf<Int, DoubleRingBuffer>() }
     val nextSeqToProcess = remember { mutableStateMapOf<Int, Long>() }
 
+    val peakCountByRep = remember { mutableStateMapOf<Int, Int>() }
+    val fftDominantFreqByRep = remember { mutableStateMapOf<Int, Double?>() }
+    val fftDominantAmpByRep = remember { mutableStateMapOf<Int, Double?>() }
+    val fftFreqByRep = remember { mutableStateMapOf<Int, DoubleArray>() }
+    val fftSpecByRep = remember { mutableStateMapOf<Int, DoubleArray>() }
+
     val kalmanXByChannel = remember { mutableStateMapOf<Int, Double>() }
     val kalmanPByChannel = remember { mutableStateMapOf<Int, Double>() }
 
     val usePython = true
-    val pythonClient = remember { PythonProcessorClient(resourcePath = "worker/python_worker.exe") }
+    val pythonClient = remember { PythonProcessorClient(resourcePath = "worker/python_worker.py") }
     val processor: ProcessorClient = remember {
         if (usePython) pythonClient else LocalProcessorClient(kalmanXByChannel, kalmanPByChannel)
     }
@@ -611,11 +741,15 @@ fun DesktopUI() {
     var procTick by remember { mutableStateOf(0L) }
 
     var droppedFirstSampleRep1 by remember { mutableStateOf(false) }
-
     var savedForThisRun by remember { mutableStateOf(false) }
     var runDone by remember { mutableStateOf(false) }
-
     var savingCsv by remember { mutableStateOf(false) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            runCatching { pythonClient.stop() }
+        }
+    }
 
     LaunchedEffect(selectedFilter, sgWindow, sgOrder, kalmanQ, kalmanR) {
         delay(350)
@@ -645,10 +779,17 @@ fun DesktopUI() {
             for ((_, fbuf) in filtBufByChannel) {
                 fbuf.clear()
             }
+
+            peakCountByRep.clear()
+            fftDominantFreqByRep.clear()
+            fftDominantAmpByRep.clear()
+            fftFreqByRep.clear()
+            fftSpecByRep.clear()
+
             kalmanXByChannel.clear()
             kalmanPByChannel.clear()
 
-            val lookback = max(2048, appliedSgWindow * 8)
+            val lookback = max(analysisLookback.toLong(), (appliedSgWindow * 8).toLong())
             for ((ch, rbuf) in rawBufByChannel) {
                 val newest = rbuf.newestSeqExclusive()
                 val oldest = rbuf.oldestSeq()
@@ -710,17 +851,18 @@ fun DesktopUI() {
                         continue
                     }
 
-                    val buf = rawBufByChannel.getOrPut(channel) { IntRingBuffer(RAW_CAP) }
+                    val buf = rawBufByChannel.getOrPut(channel) { IntRingBuffer(rawCap) }
                     buf.append(value)
 
                     val cur = nextSeqToProcess[channel]
                     if (cur == null) nextSeqToProcess[channel] = buf.oldestSeq()
                     else if (cur < buf.oldestSeq()) nextSeqToProcess[channel] = buf.oldestSeq()
 
-                    filtBufByChannel.getOrPut(channel) { DoubleRingBuffer(FILT_CAP) }
+                    filtBufByChannel.getOrPut(channel) { DoubleRingBuffer(filtCap) }
 
                     appendedAny = true
                     showPlot = true
+                    showFftPlot = false
                 }
             }
 
@@ -744,14 +886,20 @@ fun DesktopUI() {
                 sgWindow = appliedSgWindow,
                 sgOrder = appliedSgOrder,
                 kalmanQ = appliedKalmanQ,
-                kalmanR = appliedKalmanR
+                kalmanR = appliedKalmanR,
+                recordDurationSec = recordDurationSec,
+                fftEnabled = fftEnabled,
+                fftFmin = fftFmin,
+                fftFmax = fftFmax,
+                fftZeroPadFactor = fftZeroPadFactor,
+                fftUseAutoBand = fftUseAutoBand
             )
 
             var processedAny = false
 
             for (ch in rawBufByChannel.keys.sorted()) {
                 val rawBuf = rawBufByChannel[ch] ?: continue
-                val filtBuf = filtBufByChannel.getOrPut(ch) { DoubleRingBuffer(FILT_CAP) }
+                val filtBuf = filtBufByChannel.getOrPut(ch) { DoubleRingBuffer(filtCap) }
 
                 var seq = nextSeqToProcess[ch] ?: rawBuf.oldestSeq()
                 if (seq < rawBuf.oldestSeq()) seq = rawBuf.oldestSeq()
@@ -761,7 +909,12 @@ fun DesktopUI() {
                     val chunk = rawBuf.readChunk(seq, chunkSize)
                     if (chunk.isEmpty()) break
 
-                    val tailLen = if (params.type == "SG") (params.sgWindow - 1).coerceAtLeast(0) else 0
+                    val filterOverlap = if (params.type == "SG") {
+                        (params.sgWindow - 1).coerceAtLeast(0)
+                    } else {
+                        0
+                    }
+                    val tailLen = max(filterOverlap, analysisLookback)
                     val tail = if (tailLen > 0) rawBuf.readChunk(seq - tailLen, tailLen) else IntArray(0)
 
                     val resp = processor.process(
@@ -775,6 +928,12 @@ fun DesktopUI() {
                     if (resp.paramsVersion != paramsVersion) break
 
                     filtBuf.appendAll(resp.filtered)
+
+                    peakCountByRep[ch] = resp.peakCount
+                    fftDominantFreqByRep[ch] = resp.fftDominantFreq
+                    fftDominantAmpByRep[ch] = resp.fftDominantAmp
+                    fftFreqByRep[ch] = resp.fftFreq
+                    fftSpecByRep[ch] = resp.fftSpec
 
                     seq += chunk.size
                     processed++
@@ -792,29 +951,56 @@ fun DesktopUI() {
 
     val rawMapForPlot by remember(uiTick) {
         derivedStateOf {
-            rawBufByChannel.mapValues { (_, buf) -> buf.snapshotLast(PLOT_MAX_POINTS) }
+            rawBufByChannel.mapValues { (_, buf) -> buf.snapshotLast(plotMaxPoints) }
         }
     }
+
     val filteredMapForPlot by remember(procTick) {
         derivedStateOf {
-            filtBufByChannel.mapValues { (_, buf) -> buf.snapshotLast(PLOT_MAX_POINTS) }
+            filtBufByChannel.mapValues { (_, buf) -> buf.snapshotLast(plotMaxPoints) }
         }
     }
 
     val fringeCountByRep by remember(procTick) {
         derivedStateOf {
-            val reps = filteredMapForPlot.keys.sorted()
-            if (reps.isEmpty()) {
-                emptyMap()
-            } else {
-                val rep1Count = filteredMapForPlot[1]
-                    ?.let { countFringesFromZeroCrossingDouble(it) }
-                    ?: 0
+            peakCountByRep.toMap().toSortedMap()
+        }
+    }
 
-                reps.associateWith { rep ->
-                    if (rep == 1) rep1Count else rep1Count
-                }
+    val fftSummaryByRep by remember(procTick) {
+        derivedStateOf {
+            val reps = (fftDominantFreqByRep.keys + fftDominantAmpByRep.keys).toSortedSet()
+            reps.associateWith { rep ->
+                Pair(fftDominantFreqByRep[rep], fftDominantAmpByRep[rep])
             }
+        }
+    }
+
+    val fftFreqMapForPlot by remember(procTick) {
+        derivedStateOf {
+            fftFreqByRep.toMap().toSortedMap()
+        }
+    }
+
+    val fftSpecMapForPlot by remember(procTick) {
+        derivedStateOf {
+            fftSpecByRep.toMap().toSortedMap()
+        }
+    }
+
+    val plotRepetitions by remember(uiTick, procTick) {
+        derivedStateOf {
+            (rawMapForPlot.keys + filteredMapForPlot.keys + fftFreqMapForPlot.keys + fftSpecMapForPlot.keys)
+                .toSortedSet()
+                .toList()
+        }
+    }
+    var selectedPlotRep by remember { mutableStateOf<Int?>(null) }
+    LaunchedEffect(plotRepetitions) {
+        selectedPlotRep = when {
+            plotRepetitions.isEmpty() -> null
+            selectedPlotRep in plotRepetitions -> selectedPlotRep
+            else -> plotRepetitions.first()
         }
     }
 
@@ -843,136 +1029,217 @@ fun DesktopUI() {
                         .padding(bottom = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-
-                        Column(modifier = Modifier.weight(1f)) {
-                            Card(
-                                modifier = Modifier.fillMaxWidth().height(195.dp),
-                                shape = PremiumTokens.CardShape,
-                                colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
-                                elevation = PremiumTokens.cardElevation()
-                            ) {
-                                Column(Modifier.padding(12.dp)) {
-                                    Text(
-                                        "MQTT Messages",
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = PremiumTokens.Text,
-                                        letterSpacing = 0.2.sp
-                                    )
-                                    OutlinedTextField(
-                                        value = sensorMessagesList.joinToString("\n"),
-                                        onValueChange = {},
-                                        modifier = Modifier.fillMaxWidth().height(190.dp),
-                                        readOnly = true,
-                                        singleLine = false,
-                                        colors = OutlinedTextFieldDefaults.colors(
-                                            focusedBorderColor = PremiumTokens.Primary.copy(alpha = 0.55f),
-                                            unfocusedBorderColor = PremiumTokens.Border,
-                                            focusedLabelColor = PremiumTokens.Primary,
-                                            cursorColor = PremiumTokens.Primary,
-                                            focusedTextColor = PremiumTokens.Text,
-                                            unfocusedTextColor = PremiumTokens.Text,
-                                            disabledBorderColor = PremiumTokens.Border,
-                                            disabledTextColor = PremiumTokens.TextMuted
-                                        ),
-                                        shape = RoundedCornerShape(14.dp)
-                                    )
-                                }
-                            }
-
-                            Spacer(Modifier.height(16.dp))
-
-                            Card(
-                                modifier = Modifier.fillMaxWidth(),
-                                shape = PremiumTokens.CardShape,
-                                colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
-                                elevation = PremiumTokens.cardElevation()
-                            ) {
-                                Column(Modifier.padding(12.dp)) {
-                                    Text("Status", fontWeight = FontWeight.SemiBold, color = PremiumTokens.Text)
-                                    StatusIndicator(connected) {
-                                        if (connected) {
-                                            MQTTClient.disconnect()
-                                            pythonClient.stop()
-                                        } else {
-                                            MQTTClient.connect()
-                                        }
-                                        connected = !connected
-                                    }
-                                }
-                            }
-
-                            Spacer(Modifier.height(16.dp))
-
-                            Card(
-                                modifier = Modifier.fillMaxWidth(),
-                                shape = PremiumTokens.CardShape,
-                                colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
-                                elevation = PremiumTokens.cardElevation()
-                            ) {
-                                Column(Modifier.padding(12.dp)) {
-                                    Text("Mode", fontWeight = FontWeight.SemiBold, color = PremiumTokens.Text)
-                                    ModeSelectionChipGroup(mode) { newMode -> mode = newMode }
-                                }
-                            }
-                        }
-
-                        Row(modifier = Modifier.weight(2f), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Card(
-                                    modifier = Modifier.fillMaxWidth().height(408.dp),
-                                    shape = PremiumTokens.CardShape,
-                                    colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
-                                    elevation = PremiumTokens.cardElevation()
-                                ) {
-                                    Column(Modifier.padding(12.dp)) {
-                                        Text("Data Visualization", fontWeight = FontWeight.SemiBold, color = PremiumTokens.Text)
-                                        Button(
-                                            onClick = { showPlot = !showPlot },
-                                            modifier = Modifier.fillMaxWidth(),
-                                            colors = ButtonDefaults.buttonColors(
-                                                containerColor = PremiumTokens.Primary,
-                                                contentColor = Color.White
-                                            ),
-                                            elevation = PremiumTokens.buttonElevation(),
-                                            shape = RoundedCornerShape(12.dp)
-                                        ) {
-                                            Text(if (showPlot) "Hide Plot" else "Show Plot", fontWeight = FontWeight.SemiBold)
-                                        }
-                                        if (showPlot) {
-                                            Spacer(Modifier.height(2.dp))
-                                            DataPlotSection(
-                                                channelMap = rawMapForPlot,
-                                                filteredMap = filteredMapForPlot
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f, fill = true),
+                        horizontalArrangement = Arrangement.spacedBy(18.dp)
+                    ) {
                         Card(
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(400.dp),
+                            modifier = Modifier.weight(3.6f).fillMaxHeight(),
                             shape = PremiumTokens.CardShape,
                             colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
                             elevation = PremiumTokens.cardElevation()
                         ) {
                             Column(
-                                Modifier
-                                    .padding(12.dp)
-                                    .fillMaxWidth()
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(16.dp)
                             ) {
-                                Text(
-                                    "Filter Settings",
-                                    fontWeight = FontWeight.SemiBold,
-                                    fontSize = 16.sp,
-                                    color = PremiumTokens.Text
-                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        if (showFftPlot) "FFT Plot" else "Signal Plot",
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 20.sp,
+                                        color = PremiumTokens.Text
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Button(
+                                            onClick = {
+                                                if (plotRepetitions.isEmpty()) {
+                                                    dialogInfo = UiDialogInfo("Signal plot belum tersedia", "Belum ada data repetition yang bisa ditampilkan. Jalankan akuisisi data terlebih dahulu.")
+                                                } else {
+                                                    showPlot = true
+                                                    showFftPlot = false
+                                                }
+                                            },
+                                            colors = ButtonDefaults.buttonColors(
+                                                containerColor = if (showPlot) PremiumTokens.Primary else PremiumTokens.Surface,
+                                                contentColor = if (showPlot) Color.White else PremiumTokens.Text
+                                            ),
+                                            border = ButtonDefaults.outlinedButtonBorder,
+                                            shape = RoundedCornerShape(12.dp)
+                                        ) { Text("Signal Plot", fontWeight = FontWeight.SemiBold) }
+                                        Button(
+                                            onClick = {
+                                                val rep = selectedPlotRep
+                                                val hasFftData = rep != null && (fftFreqMapForPlot[rep]?.size ?: 0) >= 2 && (fftSpecMapForPlot[rep]?.size ?: 0) >= 2
+                                                if (plotRepetitions.isEmpty()) {
+                                                    dialogInfo = UiDialogInfo("FFT plot belum tersedia", "Belum ada data repetition. Jalankan akuisisi data terlebih dahulu sebelum membuka FFT plot.")
+                                                } else if (rep == null) {
+                                                    dialogInfo = UiDialogInfo("Repetition belum dipilih", "Pilih repetition terlebih dahulu untuk menampilkan FFT plot.")
+                                                } else if (!hasFftData) {
+                                                    dialogInfo = UiDialogInfo("Data FFT belum siap", "Data untuk FFT repetition $rep belum cukup atau belum selesai diproses.")
+                                                } else {
+                                                    showFftPlot = true
+                                                    showPlot = false
+                                                }
+                                            },
+                                            colors = ButtonDefaults.buttonColors(
+                                                containerColor = if (showFftPlot) PremiumTokens.Primary else PremiumTokens.Surface,
+                                                contentColor = if (showFftPlot) Color.White else PremiumTokens.Text
+                                            ),
+                                            border = ButtonDefaults.outlinedButtonBorder,
+                                            shape = RoundedCornerShape(12.dp)
+                                        ) { Text("FFT Plot", fontWeight = FontWeight.SemiBold) }
+                                    }
+                                }
 
                                 Spacer(Modifier.height(8.dp))
 
+                                if (showPlot || showFftPlot) {
+                                    RepetitionSelector(
+                                        repetitions = plotRepetitions,
+                                        selectedRep = selectedPlotRep,
+                                        onSelected = { selectedPlotRep = it }
+                                    )
+                                }
+
+                                Spacer(Modifier.height(8.dp))
+
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .weight(1f)
+                                ) {
+                                    if (showFftPlot) {
+                                        PythonFftPlotSection(
+                                            processor = processor,
+                                            paramsVersion = paramsVersion,
+                                            channel = selectedPlotRep,
+                                            fftFreq = fftFreqMapForPlot[selectedPlotRep] ?: doubleArrayOf(),
+                                            fftSpec = fftSpecMapForPlot[selectedPlotRep] ?: doubleArrayOf()
+                                        )
+                                    } else {
+                                        PythonSignalPlotSection(
+                                            processor = processor,
+                                            paramsVersion = paramsVersion,
+                                            channel = selectedPlotRep,
+                                            rawSnapshot = rawMapForPlot[selectedPlotRep].orEmpty(),
+                                            filteredSnapshot = filteredMapForPlot[selectedPlotRep].orEmpty()
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Column(
+                            modifier = Modifier
+                                .widthIn(min = 300.dp, max = 340.dp)
+                                .fillMaxHeight()
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            SidebarSectionCard(
+                                title = "System Setup",
+                                expanded = systemSetupExpanded,
+                                onToggle = { systemSetupExpanded = !systemSetupExpanded }
+                            ) {
+                                Text("Status", color = PremiumTokens.TextMuted, fontSize = 12.sp)
+                                Spacer(Modifier.height(6.dp))
+                                StatusIndicator(connected) {
+                                    if (connected) {
+                                        MQTTClient.disconnect()
+                                        pythonClient.stop()
+                                    } else {
+                                        MQTTClient.connect()
+                                    }
+                                    connected = !connected
+                                }
+                                Spacer(Modifier.height(10.dp))
+                                Text("Mode", color = PremiumTokens.TextMuted, fontSize = 12.sp)
+                                Spacer(Modifier.height(6.dp))
+                                ModeSelectionChipGroup(mode) { newMode -> mode = newMode }
+                                Spacer(Modifier.height(10.dp))
+                                OutlinedTextField(
+                                    value = angle,
+                                    onValueChange = { newValue ->
+                                        if (newValue.isEmpty() || newValue.matches(Regex("^\\d+$"))) angle = newValue else dialogInfo = UiDialogInfo(
+                                            "Input tidak valid — Angle",
+                                            "Nilai Angle harus berupa angka yang valid. Periksa kembali input Anda."
+                                        )
+                                    },
+                                    label = { Text(if (mode == "Rotasi") "Angle" else "Distance") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = PremiumTokens.Primary,
+                                        unfocusedBorderColor = PremiumTokens.Border,
+                                        focusedLabelColor = PremiumTokens.Primary,
+                                        unfocusedLabelColor = PremiumTokens.TextMuted,
+                                        cursorColor = PremiumTokens.Primary,
+                                        focusedTextColor = PremiumTokens.Text,
+                                        unfocusedTextColor = PremiumTokens.Text
+                                    ),
+                                    shape = RoundedCornerShape(14.dp)
+                                )
+                                Spacer(Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = speed,
+                                    onValueChange = { newValue ->
+                                        if (newValue.isEmpty() || newValue.matches(Regex("^\\d+$"))) speed = newValue else dialogInfo = UiDialogInfo(
+                                            "Input tidak valid — Speed",
+                                            "Nilai Speed harus berupa angka yang valid. Periksa kembali input Anda."
+                                        )
+                                    },
+                                    label = { Text("Speed") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = PremiumTokens.Primary,
+                                        unfocusedBorderColor = PremiumTokens.Border,
+                                        focusedLabelColor = PremiumTokens.Primary,
+                                        unfocusedLabelColor = PremiumTokens.TextMuted,
+                                        cursorColor = PremiumTokens.Primary,
+                                        focusedTextColor = PremiumTokens.Text,
+                                        unfocusedTextColor = PremiumTokens.Text
+                                    ),
+                                    shape = RoundedCornerShape(14.dp)
+                                )
+                                Spacer(Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = repetitions,
+                                    onValueChange = { newValue ->
+                                        if (newValue.isEmpty() || newValue.matches(Regex("^\\d+$"))) repetitions = newValue else dialogInfo = UiDialogInfo(
+                                            "Input tidak valid — Repetitions",
+                                            "Nilai Repetitions harus berupa angka bulat yang valid. Periksa kembali input Anda."
+                                        )
+                                    },
+                                    label = { Text("Repetitions") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = PremiumTokens.Primary,
+                                        unfocusedBorderColor = PremiumTokens.Border,
+                                        focusedLabelColor = PremiumTokens.Primary,
+                                        unfocusedLabelColor = PremiumTokens.TextMuted,
+                                        cursorColor = PremiumTokens.Primary,
+                                        focusedTextColor = PremiumTokens.Text,
+                                        unfocusedTextColor = PremiumTokens.Text
+                                    ),
+                                    shape = RoundedCornerShape(14.dp)
+                                )
+                            }
+
+                            SidebarSectionCard(
+                                title = "Filter Settings",
+                                expanded = filterExpanded,
+                                onToggle = { filterExpanded = !filterExpanded }
+                            ) {
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -989,10 +1256,7 @@ fun DesktopUI() {
                                                 defaultElevation = if (selectedFilter == filter) 8.dp else 2.dp,
                                                 pressedElevation = 10.dp
                                             ),
-                                            border = ButtonDefaults.outlinedButtonBorder.copy(
-                                                brush = Brush.linearGradient(listOf(PremiumTokens.Border, PremiumTokens.Border)),
-                                                width = 1.dp
-                                            ),
+                                            border = ButtonDefaults.outlinedButtonBorder,
                                             shape = RoundedCornerShape(16.dp)
                                         ) {
                                             if (selectedFilter == filter) {
@@ -1003,13 +1267,10 @@ fun DesktopUI() {
                                         }
                                     }
                                 }
-
                                 Spacer(Modifier.height(12.dp))
-
                                 when (selectedFilter) {
                                     "SG" -> {
                                         Text("Savitzky–Golay Parameters", color = PremiumTokens.TextMuted, fontWeight = FontWeight.Medium)
-
                                         Spacer(Modifier.height(6.dp))
                                         Text("Window: $sgWindow", color = PremiumTokens.TextMuted, fontSize = 13.sp)
                                         Slider(
@@ -1022,7 +1283,6 @@ fun DesktopUI() {
                                                 inactiveTrackColor = PremiumTokens.PrimarySoft
                                             )
                                         )
-
                                         Spacer(Modifier.height(6.dp))
                                         Text("Order: $sgOrder", color = PremiumTokens.TextMuted, fontSize = 13.sp)
                                         Slider(
@@ -1036,10 +1296,8 @@ fun DesktopUI() {
                                             )
                                         )
                                     }
-
                                     "Kalman" -> {
                                         Text("Kalman Filter Parameters", color = PremiumTokens.TextMuted, fontWeight = FontWeight.Medium)
-
                                         Spacer(Modifier.height(6.dp))
                                         Text("Q (Process Noise): ${"%.4f".format(kalmanQ)}", color = PremiumTokens.TextMuted, fontSize = 13.sp)
                                         Slider(
@@ -1052,7 +1310,6 @@ fun DesktopUI() {
                                                 inactiveTrackColor = PremiumTokens.PrimarySoft
                                             )
                                         )
-
                                         Spacer(Modifier.height(6.dp))
                                         Text("R (Measurement Noise): ${"%.4f".format(kalmanR)}", color = PremiumTokens.TextMuted, fontSize = 13.sp)
                                         Slider(
@@ -1067,97 +1324,91 @@ fun DesktopUI() {
                                         )
                                     }
                                 }
+                            }
 
-                                Spacer(Modifier.height(12.dp))
-                                Divider(color = PremiumTokens.Border.copy(alpha = 0.85f))
-                                Spacer(Modifier.height(10.dp))
-
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(
-                                        "Fringe Count",
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = PremiumTokens.Text
-                                    )
-                                }
-
-                                Spacer(Modifier.height(8.dp))
-
-                                val listScroll = rememberScrollState()
-
-                                if (fringeCountByRep.isEmpty()) {
-                                    Text(
-                                        "No repetition data yet.",
-                                        color = PremiumTokens.TextMuted,
-                                        fontSize = 12.sp
-                                    )
+                            SidebarSectionCard(
+                                title = "FFT Analysis",
+                                expanded = fftExpanded,
+                                onToggle = { fftExpanded = !fftExpanded }
+                            ) {
+                                if (fftSummaryByRep.isEmpty()) {
+                                    Text("No FFT result yet.", color = PremiumTokens.TextMuted, fontSize = 12.sp)
                                 } else {
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .heightIn(min = 80.dp, max = 140.dp)
-                                    ) {
-                                        Box(
-                                            modifier = Modifier
-                                                .fillMaxSize()
-                                                .padding(end = 10.dp)
-                                                .verticalScroll(listScroll)
-                                        ) {
-                                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                                fringeCountByRep.forEach { (rep, n) ->
-                                                    Row(
-                                                        modifier = Modifier.fillMaxWidth(),
-                                                        verticalAlignment = Alignment.CenterVertically,
-                                                        horizontalArrangement = Arrangement.SpaceBetween
-                                                    ) {
-                                                        Text(
-                                                            "Repetition $rep",
-                                                            color = PremiumTokens.TextMuted,
-                                                            fontSize = 12.sp,
-                                                            fontWeight = FontWeight.Medium
-                                                        )
-                                                        Surface(
-                                                            color = PremiumTokens.Surface,
-                                                            contentColor = PremiumTokens.Text,
-                                                            shape = RoundedCornerShape(999.dp),
-                                                            tonalElevation = 1.dp
-                                                        ) {
-                                                            Text(
-                                                                text = "n = $n",
-                                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                                                fontWeight = FontWeight.SemiBold,
-                                                                fontSize = 12.sp
-                                                            )
-                                                        }
-                                                    }
+                                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        fftSummaryByRep.forEach { (rep, pair) ->
+                                            val freq = pair.first
+                                            Surface(color = PremiumTokens.Surface, shape = RoundedCornerShape(14.dp)) {
+                                                Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                                    Text("Repetition $rep", color = PremiumTokens.Text, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                                                    Spacer(Modifier.height(4.dp))
+                                                    Text("Dominant freq: ${freq?.roundToInt()?.let { "$it Hz" } ?: "-"}", color = PremiumTokens.TextMuted, fontSize = 12.sp)
                                                 }
                                             }
                                         }
-
-                                        VerticalScrollbar(
-                                            adapter = rememberScrollbarAdapter(listScroll),
-                                            modifier = Modifier
-                                                .align(Alignment.CenterEnd)
-                                                .fillMaxHeight()
-                                                .width(8.dp)
-                                        )
                                     }
                                 }
                             }
+
+                            SidebarSectionCard(
+                                title = "Fringe Count",
+                                expanded = fringeExpanded,
+                                onToggle = { fringeExpanded = !fringeExpanded }
+                            ) {
+                                if (fringeCountByRep.isEmpty()) {
+                                    Text("No repetition data yet.", color = PremiumTokens.TextMuted, fontSize = 12.sp)
+                                } else {
+                                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        fringeCountByRep.forEach { (rep, n) ->
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.SpaceBetween
+                                            ) {
+                                                Text("Repetition $rep", color = PremiumTokens.TextMuted, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                                                Surface(color = PremiumTokens.Surface, contentColor = PremiumTokens.Text, shape = RoundedCornerShape(999.dp), tonalElevation = 1.dp) {
+                                                    Text(text = "$n", modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            SidebarSectionCard(
+                                title = "MQTT Messages",
+                                expanded = mqttExpanded,
+                                onToggle = { mqttExpanded = !mqttExpanded },
+                                modifier = Modifier.padding(bottom = 4.dp)
+                            ) {
+                                OutlinedTextField(
+                                    value = sensorMessagesList.joinToString("\n"),
+                                    onValueChange = {},
+                                    modifier = Modifier.fillMaxWidth().heightIn(min = 140.dp, max = 220.dp),
+                                    readOnly = true,
+                                    singleLine = false,
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = PremiumTokens.Primary.copy(alpha = 0.55f),
+                                        unfocusedBorderColor = PremiumTokens.Border,
+                                        focusedLabelColor = PremiumTokens.Primary,
+                                        cursorColor = PremiumTokens.Primary,
+                                        focusedTextColor = PremiumTokens.Text,
+                                        unfocusedTextColor = PremiumTokens.Text,
+                                        disabledBorderColor = PremiumTokens.Border,
+                                        disabledTextColor = PremiumTokens.TextMuted
+                                    ),
+                                    shape = RoundedCornerShape(14.dp)
+                                )
+                            }
                         }
                     }
-
-                    if (showAlertDialog) {
+                    dialogInfo?.let { info ->
                         AlertDialog(
-                            onDismissRequest = { showAlertDialog = false },
-                            title = { Text("Invalid Input", color = PremiumTokens.Text) },
-                            text = { Text("Input must be a number.", color = PremiumTokens.TextMuted) },
+                            onDismissRequest = { dialogInfo = null },
+                            title = { Text(info.title, color = PremiumTokens.Text) },
+                            text = { Text(info.message, color = PremiumTokens.TextMuted) },
                             confirmButton = {
                                 Button(
-                                    onClick = { showAlertDialog = false },
+                                    onClick = { dialogInfo = null },
                                     colors = ButtonDefaults.buttonColors(
                                         containerColor = PremiumTokens.Primary,
                                         contentColor = Color.White
@@ -1169,91 +1420,7 @@ fun DesktopUI() {
                             tonalElevation = 10.dp
                         )
                     }
-
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = PremiumTokens.CardShape,
-                        colors = CardDefaults.cardColors(containerColor = PremiumTokens.SurfaceAlt),
-                        elevation = PremiumTokens.cardElevation()
-                    ) {
-                        Column(Modifier.padding(12.dp)) {
-                            Text("Settings", fontWeight = FontWeight.SemiBold, color = PremiumTokens.Text)
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                OutlinedTextField(
-                                    value = angle,
-                                    onValueChange = { newValue ->
-                                        if (newValue.isEmpty() || newValue.matches(Regex("^\\d+$"))) {
-                                            angle = newValue
-                                        } else {
-                                            showAlertDialog = true
-                                        }
-                                    },
-                                    label = { Text(if (mode == "Rotasi") "Angle" else "Distance") },
-                                    modifier = Modifier.weight(1f),
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                    colors = OutlinedTextFieldDefaults.colors(
-                                        focusedBorderColor = PremiumTokens.Primary,
-                                        unfocusedBorderColor = PremiumTokens.Border,
-                                        focusedLabelColor = PremiumTokens.Primary,
-                                        unfocusedLabelColor = PremiumTokens.TextMuted,
-                                        cursorColor = PremiumTokens.Primary,
-                                        focusedTextColor = PremiumTokens.Text,
-                                        unfocusedTextColor = PremiumTokens.Text
-                                    ),
-                                    shape = RoundedCornerShape(14.dp)
-                                )
-                                OutlinedTextField(
-                                    value = speed,
-                                    onValueChange = { newValue ->
-                                        if (newValue.isEmpty() || newValue.matches(Regex("^\\d+$"))) {
-                                            speed = newValue
-                                        } else {
-                                            showAlertDialog = true
-                                        }
-                                    },
-                                    label = { Text("Speed") },
-                                    modifier = Modifier.weight(1f),
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                    colors = OutlinedTextFieldDefaults.colors(
-                                        focusedBorderColor = PremiumTokens.Primary,
-                                        unfocusedBorderColor = PremiumTokens.Border,
-                                        focusedLabelColor = PremiumTokens.Primary,
-                                        unfocusedLabelColor = PremiumTokens.TextMuted,
-                                        cursorColor = PremiumTokens.Primary,
-                                        focusedTextColor = PremiumTokens.Text,
-                                        unfocusedTextColor = PremiumTokens.Text
-                                    ),
-                                    shape = RoundedCornerShape(14.dp)
-                                )
-                                OutlinedTextField(
-                                    value = repetitions,
-                                    onValueChange = { newValue ->
-                                        if (newValue.isEmpty() || newValue.matches(Regex("^\\d+$"))) {
-                                            repetitions = newValue
-                                        } else {
-                                            showAlertDialog = true
-                                        }
-                                    },
-                                    label = { Text("Repetitions") },
-                                    modifier = Modifier.weight(1f),
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                    colors = OutlinedTextFieldDefaults.colors(
-                                        focusedBorderColor = PremiumTokens.Primary,
-                                        unfocusedBorderColor = PremiumTokens.Border,
-                                        focusedLabelColor = PremiumTokens.Primary,
-                                        unfocusedLabelColor = PremiumTokens.TextMuted,
-                                        cursorColor = PremiumTokens.Primary,
-                                        focusedTextColor = PremiumTokens.Text,
-                                        unfocusedTextColor = PremiumTokens.Text
-                                    ),
-                                    shape = RoundedCornerShape(14.dp)
-                                )
-                            }
-                        }
-                    }
+                    Spacer(Modifier.height(8.dp))
 
                     Card(
                         modifier = Modifier.fillMaxWidth(),
@@ -1268,18 +1435,34 @@ fun DesktopUI() {
                             ) {
                                 Button(
                                     onClick = {
-                                        if (angle.toIntOrNull() == null && angle.isNotEmpty() ||
-                                            speed.toIntOrNull() == null && speed.isNotEmpty() ||
-                                            repetitions.toIntOrNull() == null && repetitions.isNotEmpty()
+                                        if ((angle.toIntOrNull() == null && angle.isNotEmpty()) ||
+                                            (speed.toIntOrNull() == null && speed.isNotEmpty()) ||
+                                            (repetitions.toIntOrNull() == null && repetitions.isNotEmpty())
                                         ) {
-                                            showAlertDialog = true
+                                            dialogInfo = UiDialogInfo(
+                                                "Input belum valid",
+                                                "Pastikan Angle, Speed, dan Repetitions hanya berisi angka sebelum menekan Start."
+                                            )
+                                        } else if (angle.isBlank() || speed.isBlank() || repetitions.isBlank()) {
+                                            dialogInfo = UiDialogInfo(
+                                                "Input belum lengkap",
+                                                "Lengkapi terlebih dahulu Angle, Speed, dan Repetitions sebelum memulai proses."
+                                            )
                                         } else if (connected) {
                                             runEpoch.incrementAndGet()
+                                            pythonClient.stop()
                                             sensorMessagesList.clear()
 
                                             rawBufByChannel.clear()
                                             filtBufByChannel.clear()
                                             nextSeqToProcess.clear()
+
+                                            peakCountByRep.clear()
+                                            fftDominantFreqByRep.clear()
+                                            fftDominantAmpByRep.clear()
+                                            fftFreqByRep.clear()
+                                            fftSpecByRep.clear()
+
                                             kalmanXByChannel.clear()
                                             kalmanPByChannel.clear()
                                             droppedFirstSampleRep1 = false
@@ -1301,6 +1484,11 @@ fun DesktopUI() {
                                             if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
 
                                             MQTTClient.publish(cmd)
+                                        } else {
+                                            dialogInfo = UiDialogInfo(
+                                                "Belum terhubung",
+                                                "Hubungkan MQTT terlebih dahulu sebelum menekan Start."
+                                            )
                                         }
                                     },
                                     modifier = Modifier.weight(2f),
@@ -1310,54 +1498,71 @@ fun DesktopUI() {
                                     ),
                                     elevation = PremiumTokens.buttonElevation(),
                                     shape = RoundedCornerShape(12.dp)
-                                ) { Text("Start", fontWeight = FontWeight.SemiBold) }
+                                ) {
+                                    Text("Start", fontWeight = FontWeight.SemiBold)
+                                }
 
                                 val saveGreen = Color(0xFF16A34A)
                                 val saveGreenDisabled = Color(0xFF16A34A).copy(alpha = 0.45f)
 
                                 Button(
                                     onClick = {
-                                        if (!runDone || savedForThisRun || savingCsv) return@Button
+                                        when {
+                                            rawBufByChannel.isEmpty() -> {
+                                                dialogInfo = UiDialogInfo("Belum ada data", "CSV belum bisa disimpan karena data mentah masih kosong.")
+                                            }
+                                            savingCsv -> {
+                                                dialogInfo = UiDialogInfo("Penyimpanan sedang berjalan", "Tunggu sampai proses simpan CSV selesai.")
+                                            }
+                                            savedForThisRun -> {
+                                                dialogInfo = UiDialogInfo("CSV sudah disimpan", "Data untuk run ini sudah pernah disimpan. Jalankan eksperimen baru jika ingin membuat file berikutnya.")
+                                            }
+                                            !runDone -> {
+                                                dialogInfo = UiDialogInfo("Proses belum selesai", "Tunggu status DONE terlebih dahulu agar data yang disimpan lengkap.")
+                                            }
+                                            else -> {
+                                                scope.launch {
+                                                    savingCsv = true
+                                                    try {
+                                                        val ok = runCatching {
+                                                            awaitFilterCatchUp(
+                                                                rawBufByChannel = rawBufByChannel,
+                                                                nextSeqToProcess = nextSeqToProcess,
+                                                                timeoutMs = 3000L,
+                                                                pollMs = 25L
+                                                            )
+                                                        }.getOrDefault(false)
 
-                                        scope.launch {
-                                            savingCsv = true
-                                            try {
-                                                val ok = runCatching {
-                                                    awaitFilterCatchUp(
-                                                        rawBufByChannel = rawBufByChannel,
-                                                        nextSeqToProcess = nextSeqToProcess,
-                                                        timeoutMs = 3000L,
-                                                        pollMs = 25L
-                                                    )
-                                                }.getOrDefault(false)
+                                                        val result = runCatching {
+                                                            exportCsvSnapshotToExperiments(
+                                                                rawBufByChannel = rawBufByChannel,
+                                                                filtBufByChannel = filtBufByChannel,
+                                                                rawMax = rawCap,
+                                                                filtMax = filtCap
+                                                            )
+                                                        }
 
-                                                val result = runCatching {
-                                                    exportCsvSnapshotToExperiments(
-                                                        rawBufByChannel = rawBufByChannel,
-                                                        filtBufByChannel = filtBufByChannel,
-                                                        rawMax = RAW_CAP,
-                                                        filtMax = FILT_CAP
-                                                    )
+                                                        result.onSuccess { file ->
+                                                            sensorMessagesList.add(
+                                                                if (ok) "CSV saved: ${file.absolutePath}"
+                                                                else "CSV saved (catch-up timeout): ${file.absolutePath}"
+                                                            )
+                                                            if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+                                                            savedForThisRun = true
+                                                        }.onFailure { e ->
+                                                            sensorMessagesList.add("CSV FAILED: ${e::class.simpleName}: ${e.message}")
+                                                            if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+                                                            dialogInfo = UiDialogInfo("Gagal menyimpan CSV", e.message ?: "Terjadi error saat menyimpan file CSV.")
+                                                        }
+                                                    } finally {
+                                                        savingCsv = false
+                                                    }
                                                 }
-
-                                                result.onSuccess { file ->
-                                                    sensorMessagesList.add(
-                                                        if (ok) "CSV saved: ${file.absolutePath}"
-                                                        else "CSV saved (catch-up timeout): ${file.absolutePath}"
-                                                    )
-                                                    if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-                                                    savedForThisRun = true
-                                                }.onFailure { e ->
-                                                    sensorMessagesList.add("CSV FAILED: ${e::class.simpleName}: ${e.message}")
-                                                    if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-                                                }
-                                            } finally {
-                                                savingCsv = false
                                             }
                                         }
                                     },
                                     modifier = Modifier.weight(1f),
-                                    enabled = runDone && !savedForThisRun && !savingCsv,
+                                    enabled = true,
                                     colors = ButtonDefaults.buttonColors(
                                         containerColor = saveGreen,
                                         contentColor = Color.White,
@@ -1378,7 +1583,7 @@ fun DesktopUI() {
     }
 }
 
-/* ======================== FRINGE COUNT LOGIC ============================ */
+/* ======================== ANALYSIS HELPERS ============================ */
 
 private fun countFringesFromPeaks(values: List<Int>): Int {
     val peaks = detectPeaks(values)
@@ -1418,8 +1623,8 @@ private fun detectPeaks(values: List<Int>): List<Int> {
     return peaks
 }
 
-private fun countFringesFromPeaksDouble(values: List<Double>): Int {
-    val peaks = detectPeaksDouble(values)
+private fun countFringesFromPeaksDouble(values: DoubleArray): Int {
+    val peaks = detectPeaksDouble(values.toList())
     return (peaks.size - 1).coerceAtLeast(0)
 }
 
@@ -1456,78 +1661,6 @@ private fun detectPeaksDouble(values: List<Double>): List<Int> {
     return peaks
 }
 
-private fun countFringesFromZeroCrossingDouble(
-    values: List<Double>,
-    baselineWindow: Int = 201,
-    smoothWindow: Int = 9,
-    epsFraction: Double = 0.12,
-    minEps: Double = 0.5
-): Int {
-    if (values.size < 5) return 0
-
-    val base = movingAverageCentered(values, baselineWindow)
-    val detrended = DoubleArray(values.size) { i -> values[i] - base[i] }
-
-    val smooth = movingAverageCentered(detrended.asList(), smoothWindow)
-    val y = DoubleArray(values.size) { i -> smooth[i] }
-
-    val absMed = medianAbs(y)
-    val eps = max(minEps, epsFraction * absMed)
-
-    var state = 0
-    var upCrossings = 0
-
-    for (v in y) {
-        when {
-            v > +eps -> {
-                if (state <= 0) upCrossings++
-                state = +1
-            }
-            v < -eps -> state = -1
-            else -> {
-            }
-        }
-    }
-
-    return upCrossings.coerceAtLeast(0)
-}
-
-private fun movingAverageCentered(values: List<Double>, window: Int): DoubleArray {
-    val n = values.size
-    if (n == 0) return DoubleArray(0)
-
-    val w = window.coerceAtLeast(1).let { if (it % 2 == 0) it + 1 else it }
-    val half = w / 2
-    val out = DoubleArray(n)
-
-    fun getClamped(i: Int): Double {
-        val idx = i.coerceIn(0, n - 1)
-        return values[idx]
-    }
-
-    var sum = 0.0
-    val count = w
-
-    for (k in -half..half) sum += getClamped(k)
-    out[0] = sum / count
-
-    for (i in 1 until n) {
-        sum -= getClamped(i - 1 - half)
-        sum += getClamped(i + half)
-        out[i] = sum / count
-    }
-
-    return out
-}
-
-private fun medianAbs(x: DoubleArray): Double {
-    if (x.isEmpty()) return 0.0
-    val a = DoubleArray(x.size) { i -> kotlin.math.abs(x[i]) }
-    a.sort()
-    val mid = a.size / 2
-    return if (a.size % 2 == 1) a[mid] else (a[mid - 1] + a[mid]) * 0.5
-}
-
 /* ======================== FILTER LOGIC ============================ */
 
 fun applyFilter(
@@ -1547,10 +1680,11 @@ fun applyFilter(
 fun savitzkyGolayFilterTrue(values: List<Int>, window: Int, polyOrder: Int): List<Int> {
     if (values.isEmpty()) return values
     val w = if (window % 2 == 0) window + 1 else window
-    val p = polyOrder
+    val p = polyOrder.coerceAtMost(w - 1)
     val half = w / 2
     val coeffs = sgCoefficients(w, p)
     val out = DoubleArray(values.size)
+
     for (i in values.indices) {
         var acc = 0.0
         var idx = 0
@@ -1560,62 +1694,89 @@ fun savitzkyGolayFilterTrue(values: List<Int>, window: Int, polyOrder: Int): Lis
         }
         out[i] = acc
     }
+
     return out.map { it.roundToInt() }
 }
 
 private fun sgCoefficients(window: Int, order: Int): DoubleArray {
     val m = window / 2
     val cols = order + 1
-    val A = Array(window) { r ->
+    val a = Array(window) { r ->
         val k = r - m
         DoubleArray(cols) { c -> k.toDouble().pow(c) }
     }
-    val ATA = Array(cols) { DoubleArray(cols) }
-    for (i in 0 until cols) for (j in 0 until cols)
-        ATA[i][j] = (0 until window).sumOf { A[it][i] * A[it][j] }
-    val inv = invertMatrix(ATA)
-    val AT = Array(cols) { c -> DoubleArray(window) { r -> A[r][c] } }
+    val ata = Array(cols) { DoubleArray(cols) }
+    for (i in 0 until cols) {
+        for (j in 0 until cols) {
+            ata[i][j] = (0 until window).sumOf { a[it][i] * a[it][j] }
+        }
+    }
+    val inv = invertMatrix(ata)
+    val at = Array(cols) { c -> DoubleArray(window) { r -> a[r][c] } }
     val pinv = Array(cols) { DoubleArray(window) }
-    for (i in 0 until cols) for (j in 0 until window)
-        pinv[i][j] = (0 until cols).sumOf { inv[i][it] * AT[it][j] }
+    for (i in 0 until cols) {
+        for (j in 0 until window) {
+            pinv[i][j] = (0 until cols).sumOf { inv[i][it] * at[it][j] }
+        }
+    }
     return DoubleArray(window) { pinv[0][it] }
 }
 
-private fun invertMatrix(M: Array<DoubleArray>): Array<DoubleArray> {
-    val n = M.size
-    val A = Array(n) { M[it].clone() }
-    val I = Array(n) { DoubleArray(n) { 0.0 } }
-    for (i in 0 until n) I[i][i] = 1.0
+private fun invertMatrix(m: Array<DoubleArray>): Array<DoubleArray> {
+    val n = m.size
+    val a = Array(n) { m[it].clone() }
+    val iMat = Array(n) { DoubleArray(n) }
+    for (i in 0 until n) iMat[i][i] = 1.0
+
     for (i in 0 until n) {
-        var max = i
-        for (k in i + 1 until n) if (abs(A[k][i]) > abs(A[max][i])) max = k
-        val tmp = A[i]; A[i] = A[max]; A[max] = tmp
-        val tmpI = I[i]; I[i] = I[max]; I[max] = tmpI
-        val div = A[i][i]
-        for (j in 0 until n) { A[i][j] /= div; I[i][j] /= div }
-        for (k in 0 until n) if (k != i) {
-            val f = A[k][i]
-            for (j in 0 until n) { A[k][j] -= f * A[i][j]; I[k][j] -= f * I[i][j] }
+        var maxRow = i
+        for (k in i + 1 until n) if (abs(a[k][i]) > abs(a[maxRow][i])) maxRow = k
+
+        val tmpA = a[i]
+        a[i] = a[maxRow]
+        a[maxRow] = tmpA
+
+        val tmpI = iMat[i]
+        iMat[i] = iMat[maxRow]
+        iMat[maxRow] = tmpI
+
+        val div = a[i][i]
+        for (j in 0 until n) {
+            a[i][j] /= div
+            iMat[i][j] /= div
+        }
+
+        for (k in 0 until n) {
+            if (k != i) {
+                val f = a[k][i]
+                for (j in 0 until n) {
+                    a[k][j] -= f * a[i][j]
+                    iMat[k][j] -= f * iMat[i][j]
+                }
+            }
         }
     }
-    return I
+    return iMat
 }
 
 fun kalmanFilterBasic(values: List<Int>, processNoise: Double, measurementNoise: Double): List<Int> {
     if (values.isEmpty()) return values
+
     val out = IntArray(values.size)
     var x = values.first().toDouble()
-    var P = 1.0
-    val Q = processNoise
-    val R = measurementNoise
+    var p = 1.0
+    val q = processNoise
+    val r = measurementNoise
+
     for (i in values.indices) {
         val z = values[i].toDouble()
         val xPred = x
-        val PPred = P + Q
-        val K = PPred / (PPred + R)
-        x = xPred + K * (z - xPred)
-        P = (1 - K) * PPred
+        val pPred = p + q
+        val k = pPred / (pPred + r)
+        x = xPred + k * (z - xPred)
+        p = (1 - k) * pPred
         out[i] = x.roundToInt()
     }
+
     return out.toList()
 }

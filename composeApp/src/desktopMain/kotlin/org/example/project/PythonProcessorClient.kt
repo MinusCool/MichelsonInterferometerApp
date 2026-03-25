@@ -7,10 +7,9 @@ import java.io.BufferedWriter
 import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
-import java.nio.file.Files
 import java.net.URI
-import java.nio.file.StandardCopyOption
-import kotlin.concurrent.thread
+import java.nio.file.Files
+import java.util.concurrent.TimeUnit
 
 @Serializable
 data class PyProcParams(
@@ -19,7 +18,13 @@ data class PyProcParams(
     val sgWindow: Int,
     val sgOrder: Int,
     val kalmanQ: Double,
-    val kalmanR: Double
+    val kalmanR: Double,
+    val recordDurationSec: Double,
+    val fftEnabled: Boolean,
+    val fftFmin: Double,
+    val fftFmax: Double,
+    val fftZeroPadFactor: Int,
+    val fftUseAutoBand: Boolean
 )
 
 @Serializable
@@ -39,12 +44,42 @@ data class PyProcResponse(
     val seqStart: Long? = null,
     val paramsVersion: Long? = null,
     val filtered: DoubleArray = doubleArrayOf(),
+    val peakCount: Int? = null,
+    val fftDominantFreq: Double? = null,
+    val fftDominantAmp: Double? = null,
+    val fftFreq: DoubleArray = doubleArrayOf(),
+    val fftSpec: DoubleArray = doubleArrayOf(),
+    val error: String? = null,
+    val trace: String? = null
+)
+
+@Serializable
+data class PyRenderPlotRequest(
+    val type: String = "render_plot",
+    val channel: Int,
+    val paramsVersion: Long,
+    val plotKind: String,
+    val raw: IntArray = intArrayOf(),
+    val filtered: DoubleArray = doubleArrayOf(),
+    val fftFreq: DoubleArray = doubleArrayOf(),
+    val fftSpec: DoubleArray = doubleArrayOf(),
+    val viewStartIndex: Int? = null,
+    val viewEndExclusive: Int? = null
+)
+
+@Serializable
+data class PyRenderPlotResponse(
+    val ok: Boolean,
+    val channel: Int? = null,
+    val paramsVersion: Long? = null,
+    val plotKind: String? = null,
+    val imageBase64: String? = null,
     val error: String? = null,
     val trace: String? = null
 )
 
 class PythonProcessorClient(
-    private val resourcePath: String = "worker/python_worker.exe", // adjust per OS if needed
+    private val resourcePath: String = "worker/python_worker.py",
 ) : ProcessorClient {
 
     private val json = Json {
@@ -55,89 +90,129 @@ class PythonProcessorClient(
     private var process: Process? = null
     private var reader: BufferedReader? = null
     private var writer: BufferedWriter? = null
-    private var workerExe: File? = null
+    private var workerFile: File? = null
 
     private fun ensureStarted() {
         val p = process
         if (p != null && p.isAlive) return
 
-        // kalau ada proses lama tapi zombie
         stop()
 
-        val exe = resolveWorkerExe(resourcePath)
-        exe.setExecutable(true)
+        val worker = resolveWorkerFile(resourcePath)
+        workerFile = worker
 
-        // Retry start: menghindari CreateProcess error=32 (file terkunci sementara oleh AV/Defender)
+        val launchCommands = buildLaunchCommands(worker)
         var lastErr: Throwable? = null
-        repeat(10) { attempt ->
-            try {
-                val pb = ProcessBuilder(exe.absolutePath)
-                pb.redirectErrorStream(true)
-                val started = pb.start()
 
-                val r = BufferedReader(InputStreamReader(started.inputStream))
-                val w = BufferedWriter(OutputStreamWriter(started.outputStream))
+        for (cmd in launchCommands) {
+            repeat(2) { attempt ->
+                try {
+                    val pb = ProcessBuilder(cmd)
+                    pb.redirectErrorStream(true)
 
-                val hello = r.readLine()
-                require(hello == "READY") { "Worker did not become ready. Got: $hello" }
+                    val started = pb.start()
+                    val r = BufferedReader(InputStreamReader(started.inputStream))
+                    val w = BufferedWriter(OutputStreamWriter(started.outputStream))
 
-                process = started
-                reader = r
-                writer = w
-                return
-            } catch (t: Throwable) {
-                lastErr = t
-                // kalau file sedang locked, tunggu sebentar lalu coba lagi
-                Thread.sleep(120L + attempt * 30L)
+                    val hello = r.readLine()
+                    require(hello == "READY") {
+                        val extra = if (hello.isNullOrBlank()) "<no output>" else hello
+                        "Worker did not become ready. Got: $extra"
+                    }
+
+                    process = started
+                    reader = r
+                    writer = w
+                    return
+                } catch (t: Throwable) {
+                    lastErr = t
+                    Thread.sleep(120L + attempt * 40L)
+                }
             }
         }
-        throw IllegalStateException("Failed to start worker after retries: ${lastErr?.message}", lastErr)
+
+        throw IllegalStateException(
+            "Failed to start worker for ${worker.absolutePath}: ${lastErr?.message}",
+            lastErr
+        )
     }
 
-    /**
-     * Kalau resource bisa diakses sebagai file di disk (protocol=file),
-     * jalankan langsung tanpa extract -> ini menghindari file lock di %TEMP%.
-     * Kalau tidak (mis. sudah dipackage ke JAR), extract ke temp unik.
-     */
-    private fun resolveWorkerExe(pathInResources: String): File {
-        // cache supaya tidak extract berulang
-        workerExe?.let { if (it.exists()) return it }
+    private fun resolveWorkerFile(pathInResources: String): File {
+        workerFile?.let { if (it.exists()) return it }
+
+        val direct = File(pathInResources)
+        if (direct.exists()) return direct
+
+        val localCandidates = listOf(
+            File("composeApp/src/desktopMain/resources/$pathInResources"),
+            File("src/desktopMain/resources/$pathInResources"),
+            File("/mnt/data/${File(pathInResources).name}")
+        )
+        localCandidates.firstOrNull { it.exists() }?.let { return it }
 
         val cl = this::class.java.classLoader
-        val url = cl.getResource(pathInResources) ?: error("Worker resource not found: $pathInResources")
+        val url = cl.getResource(pathInResources)
+            ?: error("Worker resource not found: $pathInResources")
 
-        // 1) Running from IDE/Gradle: resource biasanya file://.../processedResources/.../worker/python_worker.exe
         if (url.protocol.equals("file", ignoreCase = true)) {
-            val file = File(URI(url.toString()))
-            workerExe = file
-            return file
+            return File(URI(url.toString()))
         }
 
-        // 2) Packaged (jar): extract ke temp
         cl.getResourceAsStream(pathInResources)?.use { input ->
-            val suffix = if (pathInResources.endsWith(".exe")) ".exe" else ""
+            val suffix = when {
+                pathInResources.endsWith(".exe", ignoreCase = true) -> ".exe"
+                pathInResources.endsWith(".py", ignoreCase = true) -> ".py"
+                else -> ""
+            }
             val tmp = Files.createTempFile("python_worker_", suffix).toFile()
             tmp.deleteOnExit()
             input.copyTo(tmp.outputStream())
-            workerExe = tmp
             return tmp
         }
 
         error("Worker resource stream not found: $pathInResources")
     }
 
-    fun stop() {
+    private fun buildLaunchCommands(worker: File): List<List<String>> {
+        return if (worker.extension.equals("exe", ignoreCase = true)) {
+            worker.setExecutable(true)
+            listOf(listOf(worker.absolutePath))
+        } else {
+            val cmds = mutableListOf<List<String>>()
+            val envPython = System.getenv("PYTHON_EXECUTABLE")?.trim().orEmpty()
+            if (envPython.isNotEmpty()) cmds += listOf(envPython, worker.absolutePath)
+            cmds += listOf("python", worker.absolutePath)
+            cmds += listOf("python3", worker.absolutePath)
+            cmds += listOf("py", "-3", worker.absolutePath)
+            cmds
+        }
+    }
+
+    override fun stop() {
         val p = process
-        try { writer?.close() } catch (_: Throwable) {}
-        try { reader?.close() } catch (_: Throwable) {}
+
+        try {
+            writer?.close()
+        } catch (_: Throwable) {
+        }
+
+        try {
+            reader?.close()
+        } catch (_: Throwable) {
+        }
 
         if (p != null) {
             try {
                 p.destroy()
-                p.waitFor(500, java.util.concurrent.TimeUnit.MILLISECONDS)
-            } catch (_: Throwable) {}
+                p.waitFor(500, TimeUnit.MILLISECONDS)
+            } catch (_: Throwable) {
+            }
+
             if (p.isAlive) {
-                try { p.destroyForcibly() } catch (_: Throwable) {}
+                try {
+                    p.destroyForcibly()
+                } catch (_: Throwable) {
+                }
             }
         }
 
@@ -164,22 +239,19 @@ class PythonProcessorClient(
                 sgWindow = params.sgWindow,
                 sgOrder = params.sgOrder,
                 kalmanQ = params.kalmanQ,
-                kalmanR = params.kalmanR
+                kalmanR = params.kalmanR,
+                recordDurationSec = params.recordDurationSec,
+                fftEnabled = params.fftEnabled,
+                fftFmin = params.fftFmin,
+                fftFmax = params.fftFmax,
+                fftZeroPadFactor = params.fftZeroPadFactor,
+                fftUseAutoBand = params.fftUseAutoBand
             ),
             tail = rawTail,
             chunk = rawChunk
         )
 
-        val line = json.encodeToString(PyProcRequest.serializer(), req)
-
-        val w = writer ?: error("worker writer null")
-        val r = reader ?: error("worker reader null")
-
-        w.write(line)
-        w.newLine()
-        w.flush()
-
-        val respLine = r.readLine() ?: error("Worker terminated unexpectedly")
+        val respLine = sendAndRead(json.encodeToString(PyProcRequest.serializer(), req))
         val resp = json.decodeFromString(PyProcResponse.serializer(), respLine)
 
         if (!resp.ok) {
@@ -190,32 +262,63 @@ class PythonProcessorClient(
             channel = channel,
             seqStart = seqStart,
             paramsVersion = resp.paramsVersion ?: params.version,
-            filtered = resp.filtered
+            filtered = resp.filtered,
+            peakCount = resp.peakCount ?: 0,
+            fftDominantFreq = resp.fftDominantFreq,
+            fftDominantAmp = resp.fftDominantAmp,
+            fftFreq = resp.fftFreq,
+            fftSpec = resp.fftSpec
         )
     }
 
-//    fun stop() {
-//        try {
-//            writer?.close()
-//            reader?.close()
-//        } catch (_: Throwable) {}
-//        try {
-//            process?.destroy()
-//        } catch (_: Throwable) {}
-//        writer = null
-//        reader = null
-//        process = null
-//    }
+    override fun renderPlot(
+        channel: Int,
+        paramsVersion: Long,
+        plotKind: PlotKind,
+        raw: IntArray,
+        filtered: DoubleArray,
+        fftFreq: DoubleArray,
+        fftSpec: DoubleArray,
+        viewStartIndex: Int?,
+        viewEndExclusive: Int?
+    ): PlotRenderResult {
+        ensureStarted()
 
-    private fun extractResourceToTempFile(pathInResources: String): File {
-        val cls = this::class.java.classLoader
-        val input = cls.getResourceAsStream(pathInResources)
-            ?: error("Worker resource not found: $pathInResources")
+        val req = PyRenderPlotRequest(
+            channel = channel,
+            paramsVersion = paramsVersion,
+            plotKind = plotKind.wireValue,
+            raw = raw,
+            filtered = filtered,
+            fftFreq = fftFreq,
+            fftSpec = fftSpec,
+            viewStartIndex = viewStartIndex,
+            viewEndExclusive = viewEndExclusive
+        )
 
-        val suffix = if (pathInResources.endsWith(".exe")) ".exe" else ""
-        val tmp = Files.createTempFile("python_worker_", suffix).toFile()
-        tmp.deleteOnExit()
-        input.use { it.copyTo(tmp.outputStream()) }
-        return tmp
+        val respLine = sendAndRead(json.encodeToString(PyRenderPlotRequest.serializer(), req))
+        val resp = json.decodeFromString(PyRenderPlotResponse.serializer(), respLine)
+
+        if (!resp.ok) {
+            error("Worker render error: ${resp.error}\n${resp.trace}")
+        }
+
+        return PlotRenderResult(
+            channel = channel,
+            paramsVersion = resp.paramsVersion ?: paramsVersion,
+            plotKind = plotKind,
+            imageBase64 = resp.imageBase64 ?: ""
+        )
+    }
+
+    private fun sendAndRead(line: String): String {
+        val w = writer ?: error("worker writer null")
+        val r = reader ?: error("worker reader null")
+
+        w.write(line)
+        w.newLine()
+        w.flush()
+
+        return r.readLine() ?: error("Worker terminated unexpectedly")
     }
 }
