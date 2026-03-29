@@ -39,6 +39,7 @@ import java.time.format.DateTimeFormatter
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicLong
 import org.jetbrains.skia.Image as SkiaImage
+import kotlinx.coroutines.withTimeoutOrNull
 
 
 private fun detectFilteredPeakIndicesGlobal(
@@ -234,6 +235,172 @@ fun ModeSelectionChipGroup(mode: String, onModeChange: (String) -> Unit) {
             }
             Text("Rotasi", fontWeight = FontWeight.SemiBold)
         }
+    }
+}
+
+@Composable
+private fun VariantChipGroup(selected: Int, onSelect: (Int) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        listOf(1, 2, 3).forEach { code ->
+            val label = when (code) {
+                1 -> "TEXT"
+                2 -> "BIN"
+                else -> "BIN+ZC"
+            }
+
+            Button(
+                onClick = { onSelect(code) },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (selected == code) PremiumTokens.Primary else PremiumTokens.Surface,
+                    contentColor = if (selected == code) Color.White else PremiumTokens.Text
+                ),
+                elevation = ButtonDefaults.buttonElevation(
+                    defaultElevation = if (selected == code) 8.dp else 2.dp,
+                    pressedElevation = 10.dp
+                ),
+                border = ButtonDefaults.outlinedButtonBorder,
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                if (selected == code) {
+                    Icon(Icons.Default.Check, contentDescription = "Selected", modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(4.dp))
+                }
+                Text(label, fontWeight = FontWeight.SemiBold, fontSize = 11.sp)
+            }
+        }
+    }
+}
+
+private data class UiDecodedPacket(
+    val repId: Int,
+    val variant: Variant,
+    val samples: IntArray?,
+    val seq: Long,
+    val tSendUs: Long,
+    val sampleCount: Int,
+    val channelCount: Int,
+    val sampleFmt: Int,
+    val payloadBytes: Int,
+    val crcOk: Boolean?,
+    val lenOk: Boolean?,
+    val accepted: Boolean,
+    val payloadOffset: Int? = null
+)
+
+private data class IncomingMqttFrame(
+    val epoch: Long,
+    val topic: String,
+    val payload: ByteArray,
+    val tRecvEpochUs: Long,
+    val tRecvMonoUs: Long
+)
+
+private fun decodePacketForUi(
+    payload: ByteArray,
+    activeRunId: Long?
+): UiDecodedPacket? {
+    return when (val variant = detectVariant(payload)) {
+        Variant.TEXT -> {
+            val p = parseTextPacket(payload)
+            if (p.runId != null && activeRunId != null && p.runId != activeRunId) return null
+
+            UiDecodedPacket(
+                repId = p.repId,
+                variant = variant,
+                samples = p.samples,
+                seq = p.seq,
+                tSendUs = p.tSendUs,
+                sampleCount = p.sampleCount,
+                channelCount = p.channelCount,
+                sampleFmt = p.sampleFmt,
+                payloadBytes = payload.size,
+                crcOk = null,
+                lenOk = true,
+                accepted = true,
+                payloadOffset = null
+            )
+        }
+
+        Variant.BIN -> {
+            val h = parseBinaryPacketHeader(payload)
+            val accepted = h.lenOk && h.crcOk
+            val samples = if (accepted) {
+                decodeInt16LeToIntArray(
+                    src = payload,
+                    offset = h.payloadOffset,
+                    sampleCount = h.sampleCount * h.channelCount
+                )
+            } else {
+                IntArray(0)
+            }
+
+            UiDecodedPacket(
+                repId = h.repId,
+                variant = variant,
+                samples = samples,
+                seq = h.seq,
+                tSendUs = h.tSendUs,
+                sampleCount = h.sampleCount,
+                channelCount = h.channelCount,
+                sampleFmt = h.sampleFmt,
+                payloadBytes = payload.size,
+                crcOk = h.crcOk,
+                lenOk = h.lenOk,
+                accepted = accepted,
+                payloadOffset = h.payloadOffset
+            )
+        }
+
+        Variant.BIN_ZC -> {
+            val h = parseBinaryPacketHeader(payload)
+            val accepted = h.lenOk && h.crcOk
+
+            UiDecodedPacket(
+                repId = h.repId,
+                variant = variant,
+                samples = null,
+                seq = h.seq,
+                tSendUs = h.tSendUs,
+                sampleCount = h.sampleCount,
+                channelCount = h.channelCount,
+                sampleFmt = h.sampleFmt,
+                payloadBytes = payload.size,
+                crcOk = h.crcOk,
+                lenOk = h.lenOk,
+                accepted = accepted,
+                payloadOffset = h.payloadOffset
+            )
+        }
+
+        Variant.UNKNOWN -> null
+    }
+}
+
+private fun extractRunIdFromControlMessage(message: String): Long? {
+    val key = "run_id="
+    val idx = message.indexOf(key, ignoreCase = true)
+    if (idx < 0) return null
+    val tail = message.substring(idx + key.length)
+    val digits = tail.takeWhile { it.isDigit() }
+    return digits.toLongOrNull()
+}
+
+private fun buildAutoQueue(runsPerVariant: Int, orderMode: String): List<Int> {
+    if (runsPerVariant <= 0) return emptyList()
+    return if (orderMode == "interleaved") {
+        buildList {
+            repeat(runsPerVariant) {
+                add(1)
+                add(2)
+                add(3)
+            }
+        }
+    } else {
+        List(runsPerVariant) { 1 } + List(runsPerVariant) { 2 } + List(runsPerVariant) { 3 }
     }
 }
 
@@ -704,12 +871,16 @@ fun DesktopUI() {
     val filters = listOf("SG", "Kalman")
 
     val runEpoch = remember { AtomicLong(0L) }
-    val mqttQueue = remember { Channel<Triple<Long, String, String>>(capacity = Channel.BUFFERED) }
+    val mqttQueue = remember { Channel<IncomingMqttFrame>(capacity = Channel.BUFFERED) }
+
+    var selectedVariantCode by remember { mutableStateOf(1) }
+    var activeRunId by remember { mutableStateOf<Long?>(null) }
 
     val rawCap = 200_000
     val filtCap = 200_000
     val plotMaxPoints = 5_000
     val analysisLookback = 2048
+    val processingSkipFirstSamples = 5L
 
     val recordDurationSec = 1.0
     val fftEnabled = true
@@ -740,14 +911,165 @@ fun DesktopUI() {
     var uiTick by remember { mutableStateOf(0L) }
     var procTick by remember { mutableStateOf(0L) }
 
-    var droppedFirstSampleRep1 by remember { mutableStateOf(false) }
     var savedForThisRun by remember { mutableStateOf(false) }
     var runDone by remember { mutableStateOf(false) }
     var savingCsv by remember { mutableStateOf(false) }
 
+    var donePending by remember { mutableStateOf(false) }
+    var doneSeenAtMs by remember { mutableStateOf<Long?>(null) }
+    var lastDataAtMs by remember { mutableStateOf<Long?>(null) }
+    val telemetryRows = remember { mutableStateListOf<PacketTelemetryRecord>() }
+
+    var autoRunsPerVariant by remember { mutableStateOf("10") }
+    var autoOrderMode by remember { mutableStateOf("interleaved") } // interleaved / grouped
+    var autoDelayMsText by remember { mutableStateOf("300") }
+    var autoRunnerRunning by remember { mutableStateOf(false) }
+    var autoStopRequested by remember { mutableStateOf(false) }
+
     DisposableEffect(Unit) {
         onDispose {
             runCatching { pythonClient.stop() }
+        }
+    }
+
+    fun appendSensorLog(message: String) {
+        sensorMessagesList.add(message)
+        if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+    }
+
+    fun startRunInternal(variantCode: Int): Boolean {
+        if ((angle.toIntOrNull() == null && angle.isNotEmpty()) ||
+            (speed.toIntOrNull() == null && speed.isNotEmpty()) ||
+            (repetitions.toIntOrNull() == null && repetitions.isNotEmpty())
+        ) {
+            dialogInfo = UiDialogInfo(
+                "Input belum valid",
+                "Pastikan Angle, Speed, dan Repetitions hanya berisi angka sebelum menekan Start."
+            )
+            return false
+        }
+
+        if (angle.isBlank() || speed.isBlank() || repetitions.isBlank()) {
+            dialogInfo = UiDialogInfo(
+                "Input belum lengkap",
+                "Lengkapi terlebih dahulu Angle, Speed, dan Repetitions sebelum memulai proses."
+            )
+            return false
+        }
+
+        if (!connected) {
+            dialogInfo = UiDialogInfo(
+                "Belum terhubung",
+                "Hubungkan MQTT terlebih dahulu sebelum menekan Start."
+            )
+            return false
+        }
+
+        runEpoch.incrementAndGet()
+        pythonClient.stop()
+        sensorMessagesList.clear()
+
+        rawBufByChannel.clear()
+        filtBufByChannel.clear()
+        nextSeqToProcess.clear()
+
+        peakCountByRep.clear()
+        fftDominantFreqByRep.clear()
+        fftDominantAmpByRep.clear()
+        fftFreqByRep.clear()
+        fftSpecByRep.clear()
+        telemetryRows.clear()
+
+        kalmanXByChannel.clear()
+        kalmanPByChannel.clear()
+
+        savedForThisRun = false
+        runDone = false
+        savingCsv = false
+        activeRunId = null
+
+        donePending = false
+        doneSeenAtMs = null
+        lastDataAtMs = null
+
+        uiTick++
+        procTick++
+
+        showPlot = true
+        showFftPlot = false
+
+        selectedVariantCode = variantCode
+
+        val newRunId = System.currentTimeMillis() * 1000L
+        activeRunId = newRunId
+
+        val cmd =
+            "Mode:$mode;${if (mode == "Rotasi") "Angle" else "Distance"}:$angle;" +
+                    "Speed:$speed;Repetitions:$repetitions;START;RunId:$newRunId;Variant:$variantCode"
+
+        appendSensorLog("[CMD] $cmd")
+        MQTTClient.publish(cmd)
+        return true
+    }
+
+    suspend fun saveCsvInternal(): Boolean {
+        if (rawBufByChannel.isEmpty()) {
+            dialogInfo = UiDialogInfo(
+                "Belum ada data",
+                "CSV belum bisa disimpan karena data mentah masih kosong."
+            )
+            return false
+        }
+
+        savingCsv = true
+        return try {
+            val caughtUp = runCatching {
+                awaitFilterCatchUp(
+                    rawBufByChannel = rawBufByChannel,
+                    nextSeqToProcess = nextSeqToProcess,
+                    timeoutMs = 3000L,
+                    pollMs = 25L
+                )
+            }.getOrDefault(false)
+
+            val result = runCatching {
+                exportCsvSnapshotToExperiments(
+                    rawBufByChannel = rawBufByChannel,
+                    filtBufByChannel = filtBufByChannel,
+                    rawMax = rawCap,
+                    filtMax = filtCap
+                )
+            }
+
+            result.onSuccess { file ->
+                appendSensorLog(
+                    if (caughtUp) "CSV saved: ${file.absolutePath}"
+                    else "CSV saved (catch-up timeout): ${file.absolutePath}"
+                )
+
+                if (telemetryRows.isNotEmpty()) {
+                    val packetFile = exportPacketTelemetryCsv(telemetryRows)
+                    val summary = buildRunTelemetrySummary(telemetryRows)
+                    val summaryFile = exportRunTelemetrySummaryCsv(summary)
+
+                    appendSensorLog("Packet telemetry saved: ${packetFile.absolutePath}")
+                    appendSensorLog("Run telemetry summary saved: ${summaryFile.absolutePath}")
+                } else {
+                    appendSensorLog("Packet telemetry skipped: no data")
+                }
+
+                savedForThisRun = true
+            }.onFailure { e ->
+                appendSensorLog("CSV FAILED: ${e::class.simpleName}: ${e.message}")
+                dialogInfo = UiDialogInfo(
+                    "Gagal menyimpan CSV",
+                    e.message ?: "Terjadi error saat menyimpan file CSV."
+                )
+            }
+
+            result.isSuccess
+        } finally {
+            savingCsv = false
         }
     }
 
@@ -793,7 +1115,8 @@ fun DesktopUI() {
             for ((ch, rbuf) in rawBufByChannel) {
                 val newest = rbuf.newestSeqExclusive()
                 val oldest = rbuf.oldestSeq()
-                val start = max(oldest, newest - lookback)
+                val minProcessingStart = (oldest + processingSkipFirstSamples).coerceAtMost(newest)
+                val start = max(minProcessingStart, newest - lookback)
                 nextSeqToProcess[ch] = start
             }
 
@@ -802,71 +1125,176 @@ fun DesktopUI() {
     }
 
     LaunchedEffect(Unit) {
-        MQTTClient.onMessageReceived = { topic, message ->
-            mqttQueue.trySend(Triple(runEpoch.get(), topic, message))
+        MQTTClient.onMessageReceived = { topic, payload ->
+            mqttQueue.trySend(
+                IncomingMqttFrame(
+                    epoch = runEpoch.get(),
+                    topic = topic,
+                    payload = payload,
+                    tRecvEpochUs = System.currentTimeMillis() * 1000L,
+                    tRecvMonoUs = System.nanoTime() / 1000L
+                )
+            )
+        }
+    }
+
+    LaunchedEffect(donePending, connected) {
+        if (!connected) return@LaunchedEffect
+
+        while (isActive && donePending && !runDone) {
+            delay(100L)
+            val ref = lastDataAtMs ?: doneSeenAtMs
+            if (ref != null && (System.currentTimeMillis() - ref) >= 1000L) {
+                donePending = false
+                runDone = true
+                appendSensorLog("DONE+IDLE1s → ready to save CSV")
+            }
         }
     }
 
     LaunchedEffect(Unit) {
         while (isActive) {
-            val (epoch, topic, message) = mqttQueue.receive()
-            if (epoch != runEpoch.get()) continue
+            val frame = mqttQueue.receive()
+            if (frame.epoch != runEpoch.get()) continue
+
+            val topic = frame.topic
+            val payload = frame.payload
+            val tRecvEpochUs = frame.tRecvEpochUs
+            val tRecvMonoUs = frame.tRecvMonoUs
+
+            val messageText = payload.toString(Charsets.UTF_8).trim().removeSurrounding("\"").trim()
+
+            if (payload.trim().startsWith("ERR:".toByteArray(), ignoreCase = true)) {
+                appendSensorLog("ERR seen on $topic: $messageText")
+                if (donePending) donePending = false
+                runDone = true
+                continue
+            }
+
+            if (payload.trim().startsWith("DONE".toByteArray(), ignoreCase = true)) {
+                val gotRunId = extractRunIdFromControlMessage(messageText)
+                val runOk = activeRunId != null && gotRunId != null && gotRunId == activeRunId
+
+                appendSensorLog("DONE received on $topic (${if (runOk) "match" else "ignored"}) -> $messageText")
+
+                if (runOk) {
+                    donePending = true
+                    doneSeenAtMs = System.currentTimeMillis()
+                }
+                continue
+            }
+
+            if (topic == MQTTConfig.topicCommand) {
+                appendSensorLog("[CMD-IN] $messageText")
+                continue
+            }
 
             if (topic == MQTTConfig.topicStatus) {
-                val status = message.trim().removeSurrounding("\"").trim()
-                sensorMessagesList.add("[STATUS] $status")
-                if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-
-                if (status == "DONE") {
-                    runDone = true
-                    sensorMessagesList.add("DONE received → ready to save CSV")
-                    if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-                }
+                appendSensorLog("[STATUS] $messageText")
                 continue
             }
 
             if (topic != MQTTConfig.topicData) {
-                sensorMessagesList.add("[IGNORED:$topic] $message")
-                if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+                appendSensorLog("[IGNORED:$topic] ${textPreview(payload)}")
                 continue
             }
 
-            val lines = message.lines()
-            var appendedAny = false
+            lastDataAtMs = System.currentTimeMillis()
 
-            for (rawLine in lines) {
-                val lineNorm = rawLine.trim().removeSurrounding("\"").trim()
-                if (lineNorm.isEmpty()) continue
+            val tDecodeStartUs = System.nanoTime() / 1000L
+            val decoded = try {
+                decodePacketForUi(payload, activeRunId)
+            } catch (e: Exception) {
+                appendSensorLog("[DECODE ERROR] ${e.message}")
+                null
+            }
+            val tDecodeEndUs = System.nanoTime() / 1000L
+            val decodeUs = (tDecodeEndUs - tDecodeStartUs).coerceAtLeast(0L)
 
-                val parts = lineNorm.split(":", limit = 2)
-                val channel = parts.getOrNull(0)?.trim()?.toIntOrNull()
-                val value = parts.getOrNull(1)?.trim()?.toIntOrNull()
-
-                if (channel != null && value != null) {
-                    sensorMessagesList.add("$channel:$value")
-                    if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-
-                    if (channel == 1 && !droppedFirstSampleRep1) {
-                        droppedFirstSampleRep1 = true
-                        continue
-                    }
-
-                    val buf = rawBufByChannel.getOrPut(channel) { IntRingBuffer(rawCap) }
-                    buf.append(value)
-
-                    val cur = nextSeqToProcess[channel]
-                    if (cur == null) nextSeqToProcess[channel] = buf.oldestSeq()
-                    else if (cur < buf.oldestSeq()) nextSeqToProcess[channel] = buf.oldestSeq()
-
-                    filtBufByChannel.getOrPut(channel) { DoubleRingBuffer(filtCap) }
-
-                    appendedAny = true
-                    showPlot = true
-                    showFftPlot = false
+            if (decoded == null) {
+                val preview = when (detectVariant(payload)) {
+                    Variant.TEXT -> textPreview(payload)
+                    Variant.BIN, Variant.BIN_ZC -> hexPreview(payload)
+                    Variant.UNKNOWN -> hexPreview(payload)
                 }
+                appendSensorLog("[DROP] unsupported/foreign packet: $preview")
+                continue
             }
 
-            if (appendedAny) uiTick++
+            telemetryRows += PacketTelemetryRecord(
+                variant = decoded.variant.code,
+                repId = decoded.repId,
+                seq = decoded.seq,
+                tSendUs = decoded.tSendUs,
+                tRecvEpochUs = tRecvEpochUs,
+                tRecvMonoUs = tRecvMonoUs,
+                sampleCount = decoded.sampleCount,
+                channelCount = decoded.channelCount,
+                sampleFmt = decoded.sampleFmt,
+                bytesOnWire = decoded.payloadBytes,
+                decodeUs = decodeUs,
+                crcOk = decoded.crcOk,
+                lenOk = decoded.lenOk
+            )
+
+            if (!decoded.accepted) {
+                appendSensorLog(
+                    "[DROP ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} " +
+                            "lenOk=${decoded.lenOk} crcOk=${decoded.crcOk}"
+                )
+                continue
+            }
+
+            val buf = rawBufByChannel.getOrPut(decoded.repId) { IntRingBuffer(rawCap) }
+
+            when (decoded.variant) {
+                Variant.TEXT, Variant.BIN -> {
+                    val samples = decoded.samples ?: IntArray(0)
+                    if (samples.isEmpty()) continue
+
+                    appendSensorLog(
+                        "[PKT ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} " +
+                                "samples=${samples.size} bytes=${decoded.payloadBytes} decode=${decodeUs}us"
+                    )
+
+                    buf.appendAll(samples)
+                }
+
+                Variant.BIN_ZC -> {
+                    val payloadOffset = decoded.payloadOffset ?: continue
+                    val totalSamples = decoded.sampleCount * decoded.channelCount
+
+                    decodeInt16LeInto(
+                        src = payload,
+                        offset = payloadOffset,
+                        sampleCount = totalSamples,
+                        sink = buf
+                    )
+
+                    appendSensorLog(
+                        "[PKT ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} " +
+                                "samples=$totalSamples bytes=${decoded.payloadBytes} decode=${decodeUs}us"
+                    )
+                }
+
+                Variant.UNKNOWN -> continue
+            }
+
+            val cur = nextSeqToProcess[decoded.repId]
+            val processingStart = (buf.oldestSeq() + processingSkipFirstSamples)
+                .coerceAtMost(buf.newestSeqExclusive())
+
+            if (cur == null) {
+                nextSeqToProcess[decoded.repId] = processingStart
+            } else if (cur < processingStart) {
+                nextSeqToProcess[decoded.repId] = processingStart
+            }
+
+            filtBufByChannel.getOrPut(decoded.repId) { DoubleRingBuffer(filtCap) }
+
+            uiTick++
+            showPlot = true
+            showFftPlot = false
         }
     }
 
@@ -901,8 +1329,11 @@ fun DesktopUI() {
                 val rawBuf = rawBufByChannel[ch] ?: continue
                 val filtBuf = filtBufByChannel.getOrPut(ch) { DoubleRingBuffer(filtCap) }
 
-                var seq = nextSeqToProcess[ch] ?: rawBuf.oldestSeq()
-                if (seq < rawBuf.oldestSeq()) seq = rawBuf.oldestSeq()
+                val minProcessingStart = (rawBuf.oldestSeq() + processingSkipFirstSamples)
+                    .coerceAtMost(rawBuf.newestSeqExclusive())
+
+                var seq = nextSeqToProcess[ch] ?: minProcessingStart
+                if (seq < minProcessingStart) seq = minProcessingStart
 
                 var processed = 0
                 while (seq < rawBuf.newestSeqExclusive() && processed < maxChunksPerTickPerChannel) {
@@ -951,7 +1382,16 @@ fun DesktopUI() {
 
     val rawMapForPlot by remember(uiTick) {
         derivedStateOf {
-            rawBufByChannel.mapValues { (_, buf) -> buf.snapshotLast(plotMaxPoints) }
+            rawBufByChannel.mapValues { (_, buf) ->
+                val startSeq = (buf.oldestSeq() + processingSkipFirstSamples)
+                    .coerceAtMost(buf.newestSeqExclusive())
+                val count = (buf.newestSeqExclusive() - startSeq).toInt().coerceAtLeast(0)
+                if (count <= 0) {
+                    emptyList()
+                } else {
+                    buf.readChunk(startSeq, min(plotMaxPoints, count)).toList()
+                }
+            }
         }
     }
 
@@ -1164,6 +1604,69 @@ fun DesktopUI() {
                                 Text("Mode", color = PremiumTokens.TextMuted, fontSize = 12.sp)
                                 Spacer(Modifier.height(6.dp))
                                 ModeSelectionChipGroup(mode) { newMode -> mode = newMode }
+                                Spacer(Modifier.height(10.dp))
+                                Text("Variant", color = PremiumTokens.TextMuted, fontSize = 12.sp)
+                                Spacer(Modifier.height(6.dp))
+                                VariantChipGroup(
+                                    selected = selectedVariantCode,
+                                    onSelect = { selectedVariantCode = it }
+                                )
+                                Spacer(Modifier.height(12.dp))
+                                HorizontalDivider(color = PremiumTokens.Border)
+                                Spacer(Modifier.height(12.dp))
+
+                                Text("Auto Runner", color = PremiumTokens.Text, fontWeight = FontWeight.SemiBold)
+                                Spacer(Modifier.height(8.dp))
+
+                                OutlinedTextField(
+                                    value = autoRunsPerVariant,
+                                    onValueChange = { if (it.isEmpty() || it.all(Char::isDigit)) autoRunsPerVariant = it },
+                                    label = { Text("Runs per variant") },
+                                    singleLine = true,
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+
+                                Spacer(Modifier.height(8.dp))
+
+                                Text("Order", color = PremiumTokens.TextMuted, fontSize = 12.sp)
+                                Spacer(Modifier.height(6.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Button(
+                                        onClick = { autoOrderMode = "interleaved" },
+                                        modifier = Modifier.weight(1f),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = if (autoOrderMode == "interleaved") PremiumTokens.Primary else PremiumTokens.Surface,
+                                            contentColor = if (autoOrderMode == "interleaved") Color.White else PremiumTokens.Text
+                                        )
+                                    ) {
+                                        Text("Interleaved", fontSize = 11.sp)
+                                    }
+                                    Button(
+                                        onClick = { autoOrderMode = "grouped" },
+                                        modifier = Modifier.weight(1f),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = if (autoOrderMode == "grouped") PremiumTokens.Primary else PremiumTokens.Surface,
+                                            contentColor = if (autoOrderMode == "grouped") Color.White else PremiumTokens.Text
+                                        )
+                                    ) {
+                                        Text("Grouped", fontSize = 11.sp)
+                                    }
+                                }
+
+                                Spacer(Modifier.height(8.dp))
+
+                                OutlinedTextField(
+                                    value = autoDelayMsText,
+                                    onValueChange = { if (it.isEmpty() || it.all(Char::isDigit)) autoDelayMsText = it },
+                                    label = { Text("Delay between runs (ms)") },
+                                    singleLine = true,
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
                                 Spacer(Modifier.height(10.dp))
                                 OutlinedTextField(
                                     value = angle,
@@ -1435,61 +1938,7 @@ fun DesktopUI() {
                             ) {
                                 Button(
                                     onClick = {
-                                        if ((angle.toIntOrNull() == null && angle.isNotEmpty()) ||
-                                            (speed.toIntOrNull() == null && speed.isNotEmpty()) ||
-                                            (repetitions.toIntOrNull() == null && repetitions.isNotEmpty())
-                                        ) {
-                                            dialogInfo = UiDialogInfo(
-                                                "Input belum valid",
-                                                "Pastikan Angle, Speed, dan Repetitions hanya berisi angka sebelum menekan Start."
-                                            )
-                                        } else if (angle.isBlank() || speed.isBlank() || repetitions.isBlank()) {
-                                            dialogInfo = UiDialogInfo(
-                                                "Input belum lengkap",
-                                                "Lengkapi terlebih dahulu Angle, Speed, dan Repetitions sebelum memulai proses."
-                                            )
-                                        } else if (connected) {
-                                            runEpoch.incrementAndGet()
-                                            pythonClient.stop()
-                                            sensorMessagesList.clear()
-
-                                            rawBufByChannel.clear()
-                                            filtBufByChannel.clear()
-                                            nextSeqToProcess.clear()
-
-                                            peakCountByRep.clear()
-                                            fftDominantFreqByRep.clear()
-                                            fftDominantAmpByRep.clear()
-                                            fftFreqByRep.clear()
-                                            fftSpecByRep.clear()
-
-                                            kalmanXByChannel.clear()
-                                            kalmanPByChannel.clear()
-                                            droppedFirstSampleRep1 = false
-
-                                            savedForThisRun = false
-                                            runDone = false
-                                            savingCsv = false
-
-                                            uiTick++
-                                            procTick++
-
-                                            showPlot = true
-
-                                            val cmd =
-                                                "Mode:$mode;${if (mode == "Rotasi") "Angle" else "Distance"}:$angle;" +
-                                                        "Speed:$speed;Repetitions:$repetitions;START"
-
-                                            sensorMessagesList.add("[CMD] $cmd")
-                                            if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-
-                                            MQTTClient.publish(cmd)
-                                        } else {
-                                            dialogInfo = UiDialogInfo(
-                                                "Belum terhubung",
-                                                "Hubungkan MQTT terlebih dahulu sebelum menekan Start."
-                                            )
-                                        }
+                                        startRunInternal(selectedVariantCode)
                                     },
                                     modifier = Modifier.weight(2f),
                                     colors = ButtonDefaults.buttonColors(
@@ -1504,6 +1953,106 @@ fun DesktopUI() {
 
                                 val saveGreen = Color(0xFF16A34A)
                                 val saveGreenDisabled = Color(0xFF16A34A).copy(alpha = 0.45f)
+
+                                Button(
+                                    onClick = {
+                                        if (autoRunnerRunning) return@Button
+
+                                        val n = autoRunsPerVariant.toIntOrNull()
+                                        if (n == null || n <= 0) {
+                                            dialogInfo = UiDialogInfo(
+                                                "Input Auto Runner tidak valid",
+                                                "Runs per variant harus integer > 0."
+                                            )
+                                            return@Button
+                                        }
+
+                                        val delayMs = autoDelayMsText.toLongOrNull()?.coerceAtLeast(0L) ?: 300L
+                                        val queue = buildAutoQueue(n, autoOrderMode)
+
+                                        scope.launch {
+                                            autoRunnerRunning = true
+                                            autoStopRequested = false
+                                            try {
+                                                appendSensorLog("[AUTO] START: ${queue.size} runs (order=$autoOrderMode)")
+
+                                                for ((index, variant) in queue.withIndex()) {
+                                                    if (autoStopRequested) break
+
+                                                    appendSensorLog("[AUTO] Run ${index + 1}/${queue.size} -> Variant=$variant")
+
+                                                    val started = startRunInternal(variant)
+                                                    if (!started) break
+
+                                                    val doneOk = withTimeoutOrNull(120_000L) {
+                                                        while (isActive && !runDone) {
+                                                            delay(100L)
+                                                        }
+                                                        true
+                                                    } ?: false
+
+                                                    if (!doneOk) {
+                                                        appendSensorLog("[AUTO] Timeout waiting completion for variant $variant")
+                                                        dialogInfo = UiDialogInfo(
+                                                            "Auto Runner timeout",
+                                                            "Run variant $variant tidak selesai dalam batas waktu."
+                                                        )
+                                                        break
+                                                    }
+
+                                                    val saved = saveCsvInternal()
+                                                    if (!saved) break
+
+                                                    if (index < queue.lastIndex && !autoStopRequested) {
+                                                        delay(delayMs)
+                                                    }
+                                                }
+
+                                                appendSensorLog(
+                                                    if (autoStopRequested) "[AUTO] STOP requested (stopped after current run)."
+                                                    else "[AUTO] FINISHED."
+                                                )
+                                            } finally {
+                                                autoRunnerRunning = false
+                                                autoStopRequested = false
+                                            }
+                                        }
+                                    },
+                                    modifier = Modifier.weight(2f),
+                                    enabled = !autoRunnerRunning,
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = PremiumTokens.Accent,
+                                        contentColor = Color.White,
+                                        disabledContainerColor = PremiumTokens.Accent.copy(alpha = 0.45f),
+                                        disabledContentColor = Color.White.copy(alpha = 0.7f)
+                                    ),
+                                    elevation = PremiumTokens.buttonElevation(),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Text(
+                                        if (autoRunnerRunning) "Auto Running..." else "Auto Runner",
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+
+                                Button(
+                                    onClick = {
+                                        autoStopRequested = true
+                                        appendSensorLog("[AUTO] STOP requested (will stop after current run finalizes).")
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                    enabled = autoRunnerRunning,
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = PremiumTokens.Danger,
+                                        contentColor = Color.White,
+                                        disabledContainerColor = PremiumTokens.Danger.copy(alpha = 0.45f),
+                                        disabledContentColor = Color.White.copy(alpha = 0.7f)
+                                    ),
+                                    elevation = PremiumTokens.buttonElevation(),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Text("Stop", fontWeight = FontWeight.SemiBold)
+                                }
 
                                 Button(
                                     onClick = {
@@ -1522,41 +2071,7 @@ fun DesktopUI() {
                                             }
                                             else -> {
                                                 scope.launch {
-                                                    savingCsv = true
-                                                    try {
-                                                        val ok = runCatching {
-                                                            awaitFilterCatchUp(
-                                                                rawBufByChannel = rawBufByChannel,
-                                                                nextSeqToProcess = nextSeqToProcess,
-                                                                timeoutMs = 3000L,
-                                                                pollMs = 25L
-                                                            )
-                                                        }.getOrDefault(false)
-
-                                                        val result = runCatching {
-                                                            exportCsvSnapshotToExperiments(
-                                                                rawBufByChannel = rawBufByChannel,
-                                                                filtBufByChannel = filtBufByChannel,
-                                                                rawMax = rawCap,
-                                                                filtMax = filtCap
-                                                            )
-                                                        }
-
-                                                        result.onSuccess { file ->
-                                                            sensorMessagesList.add(
-                                                                if (ok) "CSV saved: ${file.absolutePath}"
-                                                                else "CSV saved (catch-up timeout): ${file.absolutePath}"
-                                                            )
-                                                            if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-                                                            savedForThisRun = true
-                                                        }.onFailure { e ->
-                                                            sensorMessagesList.add("CSV FAILED: ${e::class.simpleName}: ${e.message}")
-                                                            if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-                                                            dialogInfo = UiDialogInfo("Gagal menyimpan CSV", e.message ?: "Terjadi error saat menyimpan file CSV.")
-                                                        }
-                                                    } finally {
-                                                        savingCsv = false
-                                                    }
+                                                    saveCsvInternal()
                                                 }
                                             }
                                         }
@@ -1581,6 +2096,15 @@ fun DesktopUI() {
             }
         }
     }
+}
+
+private fun ByteArray.trim(): ByteArray =
+    this.toString(Charsets.UTF_8).trim().toByteArray(Charsets.UTF_8)
+
+private fun ByteArray.startsWith(prefix: ByteArray, ignoreCase: Boolean): Boolean {
+    val source = this.toString(Charsets.UTF_8)
+    val target = prefix.toString(Charsets.UTF_8)
+    return source.startsWith(target, ignoreCase = ignoreCase)
 }
 
 /* ======================== ANALYSIS HELPERS ============================ */
