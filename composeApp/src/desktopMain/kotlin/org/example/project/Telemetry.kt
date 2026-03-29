@@ -51,6 +51,24 @@ data class RepTelemetryStats(
     }
 }
 
+data class RepTelemetrySummary(
+    val repId: Int,
+    val packets: Int,
+    val totalSamples: Long,
+    val avgBytesOnWire: Double,
+    val latencyP50Us: Double,
+    val latencyP99Us: Double,
+    val latencyJitterUs: Double,
+    val decodeP50Us: Double,
+    val decodeP99Us: Double,
+    val decodeJitterUs: Double,
+    val throughputSamplesPerSec: Double,
+    val crcBad: Int,
+    val lenBad: Int,
+    val q: Double,
+    val durationSec: Double
+)
+
 data class RunTelemetrySummary(
     val packets: Int,
     val totalSamples: Long,
@@ -65,7 +83,8 @@ data class RunTelemetrySummary(
     val crcBad: Int,
     val lenBad: Int,
     val qMax: Double,
-    val durationSec: Double
+    val durationSec: Double,
+    val repetitionCount: Int
 )
 
 private fun percentile(xs: List<Double>, p: Double): Double {
@@ -84,8 +103,79 @@ private fun percentile(xs: List<Double>, p: Double): Double {
     return d0 + d1
 }
 
+fun buildPerRepTelemetrySummaries(records: List<PacketTelemetryRecord>): List<RepTelemetrySummary> {
+    if (records.isEmpty()) return emptyList()
+
+    return records
+        .groupBy { it.repId }
+        .toSortedMap()
+        .map { (repId, repRecords) ->
+            val packetList = repRecords.sortedBy { it.tRecvMonoUs }
+
+            val rs = RepTelemetryStats(repId = repId)
+            packetList.forEach { p ->
+                rs.packets += 1
+                rs.samples += p.sampleCount * p.channelCount
+                rs.updateSeq(p.seq)
+            }
+
+            val anchorSend = packetList.first().tSendUs
+            val anchorRecvMono = packetList.first().tRecvMonoUs
+
+            val lRel = packetList.map { p ->
+                ((p.tRecvMonoUs - anchorRecvMono) - (p.tSendUs - anchorSend)).toDouble()
+            }
+
+            val d = packetList.map { it.decodeUs.toDouble() }
+            val s = packetList.map { it.bytesOnWire.toDouble() }
+
+            val p50L = percentile(lRel, 50.0)
+            val p99L = percentile(lRel, 99.0)
+            val p50D = percentile(d, 50.0)
+            val p99D = percentile(d, 99.0)
+
+            val t0 = packetList.first().tRecvMonoUs
+            val t1 = packetList.last().tRecvMonoUs
+            val dtSec = maxOf(1e-6, (t1 - t0).toDouble() / 1_000_000.0)
+
+            val totalSamples = packetList.sumOf { (it.sampleCount * it.channelCount).toLong() }
+            val throughput = totalSamples / dtSec
+
+            val crcBad = packetList.count { it.crcOk == false }
+            val lenBad = packetList.count { it.lenOk == false }
+
+            val smin = rs.smin
+            val smax = rs.smax
+            val q = if (smin != null && smax != null && smax >= smin) {
+                val nExpected = (smax - smin + 1L).toDouble()
+                if (nExpected > 0.0) rs.gTotal.toDouble() / nExpected else Double.NaN
+            } else {
+                Double.NaN
+            }
+
+            RepTelemetrySummary(
+                repId = repId,
+                packets = packetList.size,
+                totalSamples = totalSamples,
+                avgBytesOnWire = s.average(),
+                latencyP50Us = p50L,
+                latencyP99Us = p99L,
+                latencyJitterUs = p99L - p50L,
+                decodeP50Us = p50D,
+                decodeP99Us = p99D,
+                decodeJitterUs = p99D - p50D,
+                throughputSamplesPerSec = throughput,
+                crcBad = crcBad,
+                lenBad = lenBad,
+                q = q,
+                durationSec = dtSec
+            )
+        }
+}
+
 fun buildRunTelemetrySummary(records: List<PacketTelemetryRecord>): RunTelemetrySummary {
-    if (records.isEmpty()) {
+    val perRep = buildPerRepTelemetrySummaries(records)
+    if (perRep.isEmpty()) {
         return RunTelemetrySummary(
             packets = 0,
             totalSamples = 0,
@@ -100,68 +190,27 @@ fun buildRunTelemetrySummary(records: List<PacketTelemetryRecord>): RunTelemetry
             crcBad = 0,
             lenBad = 0,
             qMax = Double.NaN,
-            durationSec = 0.0
+            durationSec = 0.0,
+            repetitionCount = 0
         )
     }
 
-    val reps = linkedMapOf<Int, RepTelemetryStats>()
-    val packetList = records.sortedBy { it.tRecvMonoUs }
-
-    packetList.forEach { p ->
-        val rs = reps.getOrPut(p.repId) { RepTelemetryStats(repId = p.repId) }
-        rs.packets += 1
-        rs.samples += p.sampleCount * p.channelCount
-        rs.updateSeq(p.seq)
-    }
-
-    val anchorSend = packetList.first().tSendUs
-    val anchorRecvMono = packetList.first().tRecvMonoUs
-
-    val lRel = packetList.map { p ->
-        ((p.tRecvMonoUs - anchorRecvMono) - (p.tSendUs - anchorSend)).toDouble()
-    }
-    val d = packetList.map { it.decodeUs.toDouble() }
-    val s = packetList.map { it.bytesOnWire.toDouble() }
-
-    val p50L = percentile(lRel, 50.0)
-    val p99L = percentile(lRel, 99.0)
-    val p50D = percentile(d, 50.0)
-    val p99D = percentile(d, 99.0)
-
-    val t0 = packetList.first().tRecvMonoUs
-    val t1 = packetList.last().tRecvMonoUs
-    val dtSec = maxOf(1e-6, (t1 - t0).toDouble() / 1_000_000.0)
-
-    val totalSamples = packetList.sumOf { (it.sampleCount * it.channelCount).toLong() }
-    val throughput = totalSamples / dtSec
-
-    val crcBad = packetList.count { it.crcOk == false }
-    val lenBad = packetList.count { it.lenOk == false }
-
-    val qMax = reps.values.mapNotNull { rs ->
-        val smin = rs.smin
-        val smax = rs.smax
-        if (smin == null || smax == null) return@mapNotNull null
-        val nExpected = (smax - smin + 1L)
-        if (nExpected <= 0L) return@mapNotNull null
-        rs.gTotal.toDouble() / nExpected.toDouble()
-    }.maxOrNull() ?: Double.NaN
-
     return RunTelemetrySummary(
-        packets = packetList.size,
-        totalSamples = totalSamples,
-        avgBytesOnWire = s.average(),
-        latencyP50Us = p50L,
-        latencyP99Us = p99L,
-        latencyJitterUs = p99L - p50L,
-        decodeP50Us = p50D,
-        decodeP99Us = p99D,
-        decodeJitterUs = p99D - p50D,
-        throughputSamplesPerSec = throughput,
-        crcBad = crcBad,
-        lenBad = lenBad,
-        qMax = qMax,
-        durationSec = dtSec
+        packets = perRep.sumOf { it.packets },
+        totalSamples = perRep.sumOf { it.totalSamples },
+        avgBytesOnWire = perRep.map { it.avgBytesOnWire }.average(),
+        latencyP50Us = percentile(perRep.map { it.latencyP50Us }, 50.0),
+        latencyP99Us = percentile(perRep.map { it.latencyP99Us }, 50.0),
+        latencyJitterUs = percentile(perRep.map { it.latencyJitterUs }, 50.0),
+        decodeP50Us = percentile(perRep.map { it.decodeP50Us }, 50.0),
+        decodeP99Us = percentile(perRep.map { it.decodeP99Us }, 50.0),
+        decodeJitterUs = percentile(perRep.map { it.decodeJitterUs }, 50.0),
+        throughputSamplesPerSec = percentile(perRep.map { it.throughputSamplesPerSec }, 50.0),
+        crcBad = perRep.sumOf { it.crcBad },
+        lenBad = perRep.sumOf { it.lenBad },
+        qMax = perRep.map { it.q }.maxOrNull() ?: Double.NaN,
+        durationSec = perRep.sumOf { it.durationSec },
+        repetitionCount = perRep.size
     )
 }
 
@@ -204,17 +253,47 @@ fun exportPacketTelemetryCsv(records: List<PacketTelemetryRecord>): File {
     return file
 }
 
-fun exportRunTelemetrySummaryCsv(summary: RunTelemetrySummary): File {
+fun exportRunTelemetrySummaryCsv(
+    summary: RunTelemetrySummary,
+    perRep: List<RepTelemetrySummary>
+): File {
     val file = File(experimentsDir(), "run_telemetry_summary_${timestampLabel()}.csv")
     file.bufferedWriter().use { w ->
         w.appendLine(
-            "packets,total_samples,avg_bytes_on_wire," +
+            "scope,rep_id,packets,total_samples,avg_bytes_on_wire," +
                     "latency_p50_us,latency_p99_us,latency_jitter_us," +
                     "decode_p50_us,decode_p99_us,decode_jitter_us," +
-                    "throughput_samples_per_sec,crc_bad,len_bad,q_max,duration_sec"
+                    "throughput_samples_per_sec,crc_bad,len_bad,q,duration_sec,repetition_count"
         )
+
+        perRep.forEach { r ->
+            w.appendLine(
+                listOf(
+                    "rep",
+                    r.repId,
+                    r.packets,
+                    r.totalSamples,
+                    r.avgBytesOnWire,
+                    r.latencyP50Us,
+                    r.latencyP99Us,
+                    r.latencyJitterUs,
+                    r.decodeP50Us,
+                    r.decodeP99Us,
+                    r.decodeJitterUs,
+                    r.throughputSamplesPerSec,
+                    r.crcBad,
+                    r.lenBad,
+                    r.q,
+                    r.durationSec,
+                    ""
+                ).joinToString(",")
+            )
+        }
+
         w.appendLine(
             listOf(
+                "agg",
+                "",
                 summary.packets,
                 summary.totalSamples,
                 summary.avgBytesOnWire,
@@ -228,7 +307,8 @@ fun exportRunTelemetrySummaryCsv(summary: RunTelemetrySummary): File {
                 summary.crcBad,
                 summary.lenBad,
                 summary.qMax,
-                summary.durationSec
+                summary.durationSec,
+                summary.repetitionCount
             ).joinToString(",")
         )
     }

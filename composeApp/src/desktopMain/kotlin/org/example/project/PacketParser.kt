@@ -139,7 +139,7 @@ fun parseBinaryPacketHeader(payload: ByteArray): BinaryHeader {
     require((payloadBytes / 2) == sampleCount * channelCount) { "BIN: count mismatch" }
 
     val totalNeeded = headerLen + payloadBytes
-    val lenOk = payload.size >= totalNeeded
+    val lenOk = payload.size == totalNeeded
     val crcOk = lenOk && crc32Of(payload, headerLen, payloadBytes) == payloadCrc32
 
     return BinaryHeader(
@@ -198,6 +198,30 @@ fun decodeInt16LeInto(
         p += 2
     }
 }
+
+fun decodeInt16LeIntoCount(
+    src: ByteArray,
+    offset: Int,
+    sampleCount: Int,
+    sink: IntRingBuffer
+): Int {
+    if (sampleCount <= 0) return 0
+    val requiredBytes = sampleCount * 2
+    require(offset >= 0) { "offset must be >= 0" }
+    require(offset + requiredBytes <= src.size) { "decodeInt16LeIntoCount out of bounds" }
+
+    var p = offset
+    repeat(sampleCount) {
+        val lo = src[p].toInt() and 0xFF
+        val hi = src[p + 1].toInt()
+        sink.append(((hi shl 8) or lo).toShort().toInt())
+        p += 2
+    }
+    return sampleCount
+}
+
+fun decodeControlText(payload: ByteArray): String =
+    payload.toString(Charsets.UTF_8).trim().removeSurrounding("\"").trim()
 
 fun textPreview(bytes: ByteArray, limit: Int = 160): String {
     val s = bytes.toString(Charsets.UTF_8).replace("\r", "\\r").replace("\n", "\\n")

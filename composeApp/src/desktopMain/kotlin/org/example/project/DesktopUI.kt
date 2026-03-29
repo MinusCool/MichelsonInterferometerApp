@@ -834,6 +834,35 @@ private fun SidebarSectionCard(
     }
 }
 
+private fun writeDecodedPacketToBuffer(
+    decoded: UiDecodedPacket,
+    payload: ByteArray,
+    buf: IntRingBuffer
+): Int {
+    return when (decoded.variant) {
+        Variant.TEXT, Variant.BIN -> {
+            val samples = decoded.samples ?: IntArray(0)
+            if (samples.isEmpty()) 0 else {
+                buf.appendAll(samples)
+                samples.size
+            }
+        }
+
+        Variant.BIN_ZC -> {
+            val payloadOffset = decoded.payloadOffset ?: return 0
+            val totalSamples = decoded.sampleCount * decoded.channelCount
+            decodeInt16LeIntoCount(
+                src = payload,
+                offset = payloadOffset,
+                sampleCount = totalSamples,
+                sink = buf
+            )
+        }
+
+        Variant.UNKNOWN -> 0
+    }
+}
+
 @Composable
 fun DesktopUI() {
     var connected by remember { mutableStateOf(false) }
@@ -875,6 +904,8 @@ fun DesktopUI() {
 
     var selectedVariantCode by remember { mutableStateOf(1) }
     var activeRunId by remember { mutableStateOf<Long?>(null) }
+    var runInProgress by remember { mutableStateOf(false) }
+    val lastSeqByRep = remember { mutableStateMapOf<Int, Long>() }
 
     val rawCap = 200_000
     val filtCap = 200_000
@@ -987,6 +1018,8 @@ fun DesktopUI() {
         runDone = false
         savingCsv = false
         activeRunId = null
+        runInProgress = true
+        lastSeqByRep.clear()
 
         donePending = false
         doneSeenAtMs = null
@@ -1049,8 +1082,9 @@ fun DesktopUI() {
 
                 if (telemetryRows.isNotEmpty()) {
                     val packetFile = exportPacketTelemetryCsv(telemetryRows)
+                    val perRep = buildPerRepTelemetrySummaries(telemetryRows)
                     val summary = buildRunTelemetrySummary(telemetryRows)
-                    val summaryFile = exportRunTelemetrySummaryCsv(summary)
+                    val summaryFile = exportRunTelemetrySummaryCsv(summary, perRep)
 
                     appendSensorLog("Packet telemetry saved: ${packetFile.absolutePath}")
                     appendSensorLog("Run telemetry summary saved: ${summaryFile.absolutePath}")
@@ -1074,6 +1108,7 @@ fun DesktopUI() {
     }
 
     LaunchedEffect(selectedFilter, sgWindow, sgOrder, kalmanQ, kalmanR) {
+        if (runInProgress) return@LaunchedEffect
         delay(350)
 
         val w = (if (sgWindow % 2 == 0) sgWindow + 1 else sgWindow).coerceIn(3, 301)
@@ -1125,6 +1160,18 @@ fun DesktopUI() {
     }
 
     LaunchedEffect(Unit) {
+        MQTTClient.onConnectionStateChanged = { ok, err ->
+            connected = ok
+            if (!ok && err != null) {
+                dialogInfo = UiDialogInfo("MQTT disconnected", err)
+            }
+            if (!ok) {
+                runInProgress = false
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
         MQTTClient.onMessageReceived = { topic, payload ->
             mqttQueue.trySend(
                 IncomingMqttFrame(
@@ -1147,6 +1194,7 @@ fun DesktopUI() {
             if (ref != null && (System.currentTimeMillis() - ref) >= 1000L) {
                 donePending = false
                 runDone = true
+                runInProgress = false
                 appendSensorLog("DONE+IDLE1s → ready to save CSV")
             }
         }
@@ -1162,38 +1210,40 @@ fun DesktopUI() {
             val tRecvEpochUs = frame.tRecvEpochUs
             val tRecvMonoUs = frame.tRecvMonoUs
 
-            val messageText = payload.toString(Charsets.UTF_8).trim().removeSurrounding("\"").trim()
+            // 1) command / status diproses sebagai text
+            if (topic == MQTTConfig.topicCommand || topic == MQTTConfig.topicStatus) {
+                val messageText = decodeControlText(payload)
 
-            if (payload.trim().startsWith("ERR:".toByteArray(), ignoreCase = true)) {
-                appendSensorLog("ERR seen on $topic: $messageText")
-                if (donePending) donePending = false
-                runDone = true
-                continue
-            }
+                if (messageText.startsWith("ERR:", ignoreCase = true)) {
+                    appendSensorLog("ERR seen on $topic: $messageText")
+                    donePending = false
+                    runDone = true
+                    runInProgress = false
+                    continue
+                }
 
-            if (payload.trim().startsWith("DONE".toByteArray(), ignoreCase = true)) {
-                val gotRunId = extractRunIdFromControlMessage(messageText)
-                val runOk = activeRunId != null && gotRunId != null && gotRunId == activeRunId
+                if (messageText.startsWith("DONE", ignoreCase = true)) {
+                    val gotRunId = extractRunIdFromControlMessage(messageText)
+                    val runOk = activeRunId != null && gotRunId != null && gotRunId == activeRunId
 
-                appendSensorLog("DONE received on $topic (${if (runOk) "match" else "ignored"}) -> $messageText")
+                    appendSensorLog("DONE received on $topic (${if (runOk) "match" else "ignored"}) -> $messageText")
 
-                if (runOk) {
-                    donePending = true
-                    doneSeenAtMs = System.currentTimeMillis()
+                    if (runOk) {
+                        donePending = true
+                        doneSeenAtMs = System.currentTimeMillis()
+                    }
+                    continue
+                }
+
+                if (topic == MQTTConfig.topicCommand) {
+                    appendSensorLog("[CMD-IN] $messageText")
+                } else {
+                    appendSensorLog("[STATUS] $messageText")
                 }
                 continue
             }
 
-            if (topic == MQTTConfig.topicCommand) {
-                appendSensorLog("[CMD-IN] $messageText")
-                continue
-            }
-
-            if (topic == MQTTConfig.topicStatus) {
-                appendSensorLog("[STATUS] $messageText")
-                continue
-            }
-
+            // 2) hanya topic data yang masuk jalur data-plane
             if (topic != MQTTConfig.topicData) {
                 appendSensorLog("[IGNORED:$topic] ${textPreview(payload)}")
                 continue
@@ -1202,14 +1252,13 @@ fun DesktopUI() {
             lastDataAtMs = System.currentTimeMillis()
 
             val tDecodeStartUs = System.nanoTime() / 1000L
+
             val decoded = try {
                 decodePacketForUi(payload, activeRunId)
             } catch (e: Exception) {
                 appendSensorLog("[DECODE ERROR] ${e.message}")
                 null
             }
-            val tDecodeEndUs = System.nanoTime() / 1000L
-            val decodeUs = (tDecodeEndUs - tDecodeStartUs).coerceAtLeast(0L)
 
             if (decoded == null) {
                 val preview = when (detectVariant(payload)) {
@@ -1220,6 +1269,45 @@ fun DesktopUI() {
                 appendSensorLog("[DROP] unsupported/foreign packet: $preview")
                 continue
             }
+
+            if (!decoded.accepted) {
+                val tDecodeEndUs = System.nanoTime() / 1000L
+                val decodeUs = (tDecodeEndUs - tDecodeStartUs).coerceAtLeast(0L)
+
+                telemetryRows += PacketTelemetryRecord(
+                    variant = decoded.variant.code,
+                    repId = decoded.repId,
+                    seq = decoded.seq,
+                    tSendUs = decoded.tSendUs,
+                    tRecvEpochUs = tRecvEpochUs,
+                    tRecvMonoUs = tRecvMonoUs,
+                    sampleCount = decoded.sampleCount,
+                    channelCount = decoded.channelCount,
+                    sampleFmt = decoded.sampleFmt,
+                    bytesOnWire = decoded.payloadBytes,
+                    decodeUs = decodeUs,
+                    crcOk = decoded.crcOk,
+                    lenOk = decoded.lenOk
+                )
+
+                appendSensorLog(
+                    "[DROP ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} " +
+                            "lenOk=${decoded.lenOk} crcOk=${decoded.crcOk}"
+                )
+                continue
+            }
+
+            val buf = rawBufByChannel.getOrPut(decoded.repId) { IntRingBuffer(rawCap) }
+
+            val writtenSamples = try {
+                writeDecodedPacketToBuffer(decoded, payload, buf)
+            } catch (e: Exception) {
+                appendSensorLog("[WRITE ERROR] ${e.message}")
+                0
+            }
+
+            val tDecodeEndUs = System.nanoTime() / 1000L
+            val decodeUs = (tDecodeEndUs - tDecodeStartUs).coerceAtLeast(0L)
 
             telemetryRows += PacketTelemetryRecord(
                 variant = decoded.variant.code,
@@ -1237,48 +1325,20 @@ fun DesktopUI() {
                 lenOk = decoded.lenOk
             )
 
-            if (!decoded.accepted) {
+            if (writtenSamples <= 0) continue
+
+            val prevSeq = lastSeqByRep[decoded.repId]
+            if (prevSeq != null && decoded.seq > prevSeq + 1L) {
                 appendSensorLog(
-                    "[DROP ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} " +
-                            "lenOk=${decoded.lenOk} crcOk=${decoded.crcOk}"
+                    "[GAP] rep=${decoded.repId} prev_seq=$prevSeq current_seq=${decoded.seq} missing=${decoded.seq - prevSeq - 1L}"
                 )
-                continue
             }
+            lastSeqByRep[decoded.repId] = decoded.seq
 
-            val buf = rawBufByChannel.getOrPut(decoded.repId) { IntRingBuffer(rawCap) }
-
-            when (decoded.variant) {
-                Variant.TEXT, Variant.BIN -> {
-                    val samples = decoded.samples ?: IntArray(0)
-                    if (samples.isEmpty()) continue
-
-                    appendSensorLog(
-                        "[PKT ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} " +
-                                "samples=${samples.size} bytes=${decoded.payloadBytes} decode=${decodeUs}us"
-                    )
-
-                    buf.appendAll(samples)
-                }
-
-                Variant.BIN_ZC -> {
-                    val payloadOffset = decoded.payloadOffset ?: continue
-                    val totalSamples = decoded.sampleCount * decoded.channelCount
-
-                    decodeInt16LeInto(
-                        src = payload,
-                        offset = payloadOffset,
-                        sampleCount = totalSamples,
-                        sink = buf
-                    )
-
-                    appendSensorLog(
-                        "[PKT ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} " +
-                                "samples=$totalSamples bytes=${decoded.payloadBytes} decode=${decodeUs}us"
-                    )
-                }
-
-                Variant.UNKNOWN -> continue
-            }
+            appendSensorLog(
+                "[PKT ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} " +
+                        "samples=$writtenSamples bytes=${decoded.payloadBytes} decode=${decodeUs}us"
+            )
 
             val cur = nextSeqToProcess[decoded.repId]
             val processingStart = (buf.oldestSeq() + processingSkipFirstSamples)
@@ -1598,7 +1658,6 @@ fun DesktopUI() {
                                     } else {
                                         MQTTClient.connect()
                                     }
-                                    connected = !connected
                                 }
                                 Spacer(Modifier.height(10.dp))
                                 Text("Mode", color = PremiumTokens.TextMuted, fontSize = 12.sp)
