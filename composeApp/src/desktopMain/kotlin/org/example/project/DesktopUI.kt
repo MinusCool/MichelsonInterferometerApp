@@ -1640,6 +1640,14 @@ fun DesktopUI() {
                                             )
                                         } else if (connected) {
                                             runEpoch.incrementAndGet()
+
+                                            // Reset Python worker supaya state peak/fringe dari run sebelumnya
+                                            // tidak terbawa ke run yang baru.
+                                            runCatching { pythonClient.stop() }
+
+                                            // Paksa analisis berikutnya dianggap sebagai eksperimen baru.
+                                            paramsVersion++
+
                                             sensorMessagesList.clear()
 
                                             rawBufByChannel.clear()
@@ -1660,10 +1668,12 @@ fun DesktopUI() {
                                             runDone = false
                                             savingCsv = false
 
+                                            selectedPlotRep = null
+                                            showPlot = true
+                                            showFftPlot = false
+
                                             uiTick++
                                             procTick++
-
-                                            showPlot = true
 
                                             val cmd =
                                                 "Mode:$mode;${if (mode == "Rotasi") "Angle" else "Distance"}:$angle;" +
