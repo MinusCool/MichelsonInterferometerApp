@@ -7,68 +7,123 @@ import kotlin.math.max
 import kotlin.math.min
 
 class IntRingBuffer(private val capacity: Int) {
-    private val data = ArrayDeque<Int>(capacity)
+    init {
+        require(capacity > 0) { "capacity must be > 0" }
+    }
+
+    private val data = IntArray(capacity)
+    private var head = 0
+    private var size = 0
     private var oldestSeqValue = 0L
 
     fun append(value: Int) {
-        if (data.size == capacity) {
-            data.removeFirst()
-            oldestSeqValue += 1L
+        if (size < capacity) {
+            val tail = (head + size) % capacity
+            data[tail] = value
+            size++
+        } else {
+            data[head] = value
+            head = (head + 1) % capacity
+            oldestSeqValue++
         }
-        data.addLast(value)
+    }
+
+    fun appendAll(values: IntArray, offset: Int = 0, length: Int = values.size - offset) {
+        if (length <= 0) return
+        val safeOffset = offset.coerceIn(0, values.size)
+        val safeLength = length.coerceIn(0, values.size - safeOffset)
+        for (i in 0 until safeLength) {
+            append(values[safeOffset + i])
+        }
     }
 
     fun clear() {
-        data.clear()
+        head = 0
+        size = 0
+        oldestSeqValue = 0L
     }
 
     fun oldestSeq(): Long = oldestSeqValue
-    fun newestSeqExclusive(): Long = oldestSeqValue + data.size
+    fun newestSeqExclusive(): Long = oldestSeqValue + size
 
     fun readChunk(seqStart: Long, maxCount: Int): IntArray {
-        if (maxCount <= 0 || data.isEmpty()) return IntArray(0)
+        if (maxCount <= 0 || size == 0) return IntArray(0)
+
         val start = max(seqStart, oldestSeqValue)
         val endExclusive = min(start + maxCount.toLong(), newestSeqExclusive())
         if (endExclusive <= start) return IntArray(0)
-        val from = (start - oldestSeqValue).toInt()
-        val to = (endExclusive - oldestSeqValue).toInt()
-        return data.toList().subList(from, to).toIntArray()
+
+        val outSize = (endExclusive - start).toInt()
+        val out = IntArray(outSize)
+        val startIndex = (start - oldestSeqValue).toInt()
+
+        for (i in 0 until outSize) {
+            out[i] = data[(head + startIndex + i) % capacity]
+        }
+        return out
     }
 
     fun snapshotLast(maxCount: Int): List<Int> {
-        if (maxCount <= 0) return emptyList()
-        val list = data.toList()
-        return if (list.size <= maxCount) list else list.takeLast(maxCount)
+        if (maxCount <= 0 || size == 0) return emptyList()
+        val count = min(maxCount, size)
+        val out = ArrayList<Int>(count)
+        val startIndex = size - count
+        for (i in 0 until count) {
+            out.add(data[(head + startIndex + i) % capacity])
+        }
+        return out
     }
 }
 
 class DoubleRingBuffer(private val capacity: Int) {
-    private val data = ArrayDeque<Double>(capacity)
+    init {
+        require(capacity > 0) { "capacity must be > 0" }
+    }
+
+    private val data = DoubleArray(capacity)
+    private var head = 0
+    private var size = 0
     private var oldestSeqValue = 0L
 
     fun append(value: Double) {
-        if (data.size == capacity) {
-            data.removeFirst()
-            oldestSeqValue += 1L
+        if (size < capacity) {
+            val tail = (head + size) % capacity
+            data[tail] = value
+            size++
+        } else {
+            data[head] = value
+            head = (head + 1) % capacity
+            oldestSeqValue++
         }
-        data.addLast(value)
     }
 
-    fun appendAll(values: DoubleArray) {
-        values.forEach { append(it) }
+    fun appendAll(values: DoubleArray, offset: Int = 0, length: Int = values.size - offset) {
+        if (length <= 0) return
+        val safeOffset = offset.coerceIn(0, values.size)
+        val safeLength = length.coerceIn(0, values.size - safeOffset)
+        for (i in 0 until safeLength) {
+            append(values[safeOffset + i])
+        }
     }
 
     fun clear() {
-        data.clear()
+        head = 0
+        size = 0
+        oldestSeqValue = 0L
     }
 
     fun oldestSeq(): Long = oldestSeqValue
-    fun newestSeqExclusive(): Long = oldestSeqValue + data.size
+    fun newestSeqExclusive(): Long = oldestSeqValue + size
 
     fun snapshotLast(maxCount: Int): List<Double> {
-        if (maxCount <= 0) return emptyList()
-        val list = data.toList()
-        return if (list.size <= maxCount) list else list.takeLast(maxCount)
+        if (maxCount <= 0 || size == 0) return emptyList()
+        val count = min(maxCount, size)
+        val out = ArrayList<Double>(count)
+        val startIndex = size - count
+        for (i in 0 until count) {
+            out.add(data[(head + startIndex + i) % capacity])
+        }
+        return out
     }
 }
 

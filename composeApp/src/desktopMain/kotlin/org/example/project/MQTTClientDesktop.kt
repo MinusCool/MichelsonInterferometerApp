@@ -1,17 +1,23 @@
 package org.example.project
 
-import org.eclipse.paho.client.mqttv3.*
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
+import org.eclipse.paho.client.mqttv3.MqttCallback
+import org.eclipse.paho.client.mqttv3.MqttClient
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions
+import org.eclipse.paho.client.mqttv3.MqttException
+import org.eclipse.paho.client.mqttv3.MqttMessage
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 
 actual object MQTTClient {
     private val persistence = MemoryPersistence()
     private var mqttClient: MqttClient? = null
 
-    // kirim topic + payload ke UI
-    actual var onMessageReceived: (String, String) -> Unit = { _, _ -> }
+    actual var onMessageReceived: (String, ByteArray) -> Unit = { _, _ -> }
 
     actual fun connect() {
         try {
+            if (mqttClient?.isConnected == true) return
+
             mqttClient = MqttClient(MQTTConfig.broker, MQTTConfig.clientId, persistence)
             val connOpts = MqttConnectOptions().apply {
                 isCleanSession = true
@@ -26,9 +32,9 @@ actual object MQTTClient {
 
                 override fun messageArrived(topic: String?, message: MqttMessage?) {
                     val t = topic ?: ""
-                    val received = message?.toString() ?: ""
-                    println("Message received [$t]: $received")
-                    onMessageReceived(t, received)
+                    val payload = message?.payload ?: ByteArray(0)
+                    println("Message received [$t]: ${payload.size} bytes")
+                    onMessageReceived(t, payload)
                 }
 
                 override fun deliveryComplete(token: IMqttDeliveryToken?) {
@@ -38,12 +44,13 @@ actual object MQTTClient {
             println("Connecting to broker: ${MQTTConfig.broker}")
             mqttClient?.connect(connOpts)
 
-            // subscribe hanya ke topic output dari ESP32
+            mqttClient?.subscribe(MQTTConfig.topicCommand)
             mqttClient?.subscribe(MQTTConfig.topicData)
             mqttClient?.subscribe(MQTTConfig.topicStatus)
 
             println(
-                "Connected and subscribed to ${MQTTConfig.topicData} and ${MQTTConfig.topicStatus}"
+                "Connected and subscribed to " +
+                        "${MQTTConfig.topicCommand}, ${MQTTConfig.topicData}, ${MQTTConfig.topicStatus}"
             )
         } catch (e: MqttException) {
             println("Error Connecting: ${e.message}")
@@ -63,7 +70,7 @@ actual object MQTTClient {
         try {
             mqttClient?.publish(
                 MQTTConfig.topicCommand,
-                MqttMessage(message.toByteArray())
+                MqttMessage(message.toByteArray(Charsets.UTF_8))
             )
             println("Message published to ${MQTTConfig.topicCommand}: $message")
         } catch (e: MqttException) {
