@@ -132,6 +132,168 @@ private object PremiumTokens {
     )
 }
 
+private object StepperMathConstants {
+    const val stepsPerRev = 200
+    const val microstep = 16
+    const val ratio = 3
+    const val leadScrewLeadMm = 8.0
+    const val returnDurationSec = 0.05
+
+    val stepsPerMm: Double = (stepsPerRev.toDouble() * microstep.toDouble()) / leadScrewLeadMm
+    val stepsPerDegree: Double = (stepsPerRev.toDouble() * microstep.toDouble() * ratio.toDouble()) / 360.0
+    val degreePerStep: Double = 360.0 / (stepsPerRev.toDouble() * microstep.toDouble() * ratio.toDouble())
+    val mmPerStep: Double = leadScrewLeadMm / (stepsPerRev.toDouble() * microstep.toDouble())
+}
+
+private data class StepperPreview(
+    val mode: String,
+    val inputLabel: String,
+    val inputValue: Int?,
+    val inputUnit: String,
+    val speedValue: Int?,
+    val stepsPerUnit: Double,
+    val rawTargetSteps: Double?,
+    val appliedTargetSteps: Long?,
+    val forwardSpeedStepsPerSec: Double?,
+    val returnSpeedStepsPerSec: Double?
+)
+
+private fun buildStepperPreview(mode: String, angleOrDistanceText: String, speedText: String): StepperPreview {
+    val inputValue = angleOrDistanceText.toIntOrNull()
+    val speedValue = speedText.toIntOrNull()
+    val isLinear = mode == "Linear"
+    val stepsPerUnit = if (isLinear) StepperMathConstants.stepsPerMm else StepperMathConstants.stepsPerDegree
+    val rawTargetSteps = inputValue?.toDouble()?.times(stepsPerUnit)
+    val appliedTargetSteps = rawTargetSteps?.toLong()
+    val forwardSpeed = if (rawTargetSteps != null && speedValue != null && speedValue > 0) {
+        rawTargetSteps / speedValue.toDouble()
+    } else null
+    val returnSpeed = rawTargetSteps?.div(StepperMathConstants.returnDurationSec)
+
+
+    return StepperPreview(
+        mode = mode,
+        inputLabel = if (isLinear) "Distance" else "Angle",
+        inputValue = inputValue,
+        inputUnit = if (isLinear) "mm" else "deg",
+        speedValue = speedValue,
+        stepsPerUnit = stepsPerUnit,
+        rawTargetSteps = rawTargetSteps,
+        appliedTargetSteps = appliedTargetSteps,
+        forwardSpeedStepsPerSec = forwardSpeed,
+        returnSpeedStepsPerSec = returnSpeed
+    )
+}
+
+private fun Double.formatPreview(decimals: Int = 4): String {
+    if (!isFinite()) return "-"
+    val roundedInt = round(this)
+    if (abs(this - roundedInt) < 1e-9) return roundedInt.toLong().toString()
+    return String.format(java.util.Locale.US, "%.${decimals}f", this).trimEnd('0').trimEnd('.')
+}
+
+@Composable
+private fun StepperValueRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.Top
+    ) {
+        Text(label, color = PremiumTokens.TextMuted, fontSize = 12.sp)
+        Spacer(Modifier.width(12.dp))
+        Text(
+            value,
+            color = PremiumTokens.Text,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            lineHeight = 16.sp,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+@Composable
+private fun FormulaBlock(title: String, lines: List<String>) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(PremiumTokens.PrimarySoft, RoundedCornerShape(12.dp))
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Text(title, color = PremiumTokens.Primary, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+        lines.forEach { line ->
+            Text(line, color = PremiumTokens.Text, fontSize = 12.sp, lineHeight = 16.sp)
+        }
+    }
+}
+
+@Composable
+private fun StepperPreviewCard(mode: String, angleOrDistanceText: String, speedText: String) {
+    val preview = remember(mode, angleOrDistanceText, speedText) {
+        buildStepperPreview(mode, angleOrDistanceText, speedText)
+    }
+    val isLinear = preview.mode == "Linear"
+    val inputReady = preview.inputValue != null
+    val speedReady = preview.speedValue != null && preview.speedValue > 0
+    val rawTarget = preview.rawTargetSteps
+    val rawTargetText = rawTarget?.formatPreview() ?: "-"
+    val appliedTargetText = preview.appliedTargetSteps?.toString() ?: "-"
+    val forwardSpeedText = preview.forwardSpeedStepsPerSec?.formatPreview() ?: "-"
+
+    val constantsBlock = if (isLinear) {
+        listOf(
+            "Steps per revolution: ${StepperMathConstants.stepsPerRev}",
+            "Microstep: ${StepperMathConstants.microstep}",
+            "Lead screw travel: ${StepperMathConstants.leadScrewLeadMm.formatPreview()} mm/rev",
+            "1 step = ${StepperMathConstants.mmPerStep.formatPreview(6)} mm",
+            "1 mm = ${StepperMathConstants.stepsPerMm.formatPreview()} steps"
+        )
+    } else {
+        listOf(
+            "Steps per revolution: ${StepperMathConstants.stepsPerRev}",
+            "Microstep: ${StepperMathConstants.microstep}",
+            "Ratio: ${StepperMathConstants.ratio}",
+            "1 step = ${StepperMathConstants.degreePerStep.formatPreview(6)}°",
+            "1° = ${StepperMathConstants.stepsPerDegree.formatPreview()} steps"
+        )
+    }
+
+    val targetBlock = if (inputReady) {
+        listOf(
+            if (isLinear)
+                "${preview.inputValue} mm x ${preview.stepsPerUnit.formatPreview()} = $rawTargetText steps"
+            else
+                "${preview.inputValue}° x ${preview.stepsPerUnit.formatPreview()} = $rawTargetText steps",
+            "Motor steps used: $appliedTargetText"
+        )
+    } else {
+        listOf("Enter an ${preview.inputLabel.lowercase()} value to see the estimated motor steps.")
+    }
+
+    val speedBlock = when {
+        !inputReady -> listOf("Speed details will appear after you enter an ${preview.inputLabel.lowercase()} value.")
+        !speedReady -> listOf(
+            "Enter a speed value greater than 0.",
+            "Moving Speed = Estimated Motor Steps / Move Duration"
+        )
+        else -> listOf(
+            "Moving Speed: $rawTargetText / ${preview.speedValue} = $forwardSpeedText steps/s"
+        )
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        StepperValueRow("Movement Type", preview.mode)
+        StepperValueRow("Input ${preview.inputLabel}", preview.inputValue?.let { "$it ${preview.inputUnit}" } ?: "-")
+        StepperValueRow("Move Duration", preview.speedValue?.let { "$it s" } ?: "-")
+        StepperValueRow("Motor Steps", "$appliedTargetText step")
+        Spacer(Modifier.height(4.dp))
+        FormulaBlock("Calculation Details", constantsBlock)
+        FormulaBlock("How It Is Calculated", targetBlock)
+        FormulaBlock("Speed Details", speedBlock)
+    }
+}
+
 /* ======================== MQTT + UI ============================ */
 
 @Composable
@@ -680,6 +842,7 @@ fun DesktopUI() {
     val sensorMessagesList = remember { mutableStateListOf<String>() }
     var dialogInfo by remember { mutableStateOf<UiDialogInfo?>(null) }
     var systemSetupExpanded by remember { mutableStateOf(true) }
+    var stepperCalcExpanded by remember { mutableStateOf(true) }
     var filterExpanded by remember { mutableStateOf(true) }
     var fftExpanded by remember { mutableStateOf(true) }
     var fringeExpanded by remember { mutableStateOf(true) }
@@ -740,7 +903,7 @@ fun DesktopUI() {
     var uiTick by remember { mutableStateOf(0L) }
     var procTick by remember { mutableStateOf(0L) }
 
-    var droppedFirstSampleRep1 by remember { mutableStateOf(false) }
+    val droppedStartupSampleByChannel = remember { mutableStateMapOf<Int, Boolean>() }
     var savedForThisRun by remember { mutableStateOf(false) }
     var runDone by remember { mutableStateOf(false) }
     var savingCsv by remember { mutableStateOf(false) }
@@ -846,8 +1009,11 @@ fun DesktopUI() {
                     sensorMessagesList.add("$channel:$value")
                     if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
 
-                    if (channel == 1 && !droppedFirstSampleRep1) {
-                        droppedFirstSampleRep1 = true
+                    val alreadyDropped = droppedStartupSampleByChannel[channel] == true
+                    if (!alreadyDropped) {
+                        droppedStartupSampleByChannel[channel] = true
+                        sensorMessagesList.add("[SUPPRESS] startup outlier skipped for repetition $channel: $value")
+                        if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
                         continue
                     }
 
@@ -917,13 +1083,25 @@ fun DesktopUI() {
                     val tailLen = max(filterOverlap, analysisLookback)
                     val tail = if (tailLen > 0) rawBuf.readChunk(seq - tailLen, tailLen) else IntArray(0)
 
-                    val resp = processor.process(
-                        channel = ch,
-                        seqStart = seq,
-                        rawTail = tail,
-                        rawChunk = chunk,
-                        params = params
-                    )
+                    val resp = try {
+                        processor.process(
+                            channel = ch,
+                            seqStart = seq,
+                            rawTail = tail,
+                            rawChunk = chunk,
+                            params = params
+                        )
+                    } catch (e: Throwable) {
+                        sensorMessagesList.add("[PROCESS ERROR][rep $ch] ${e.message ?: e::class.simpleName ?: "Unknown error"}")
+                        if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+                        dialogInfo = UiDialogInfo(
+                            "Processing error",
+                            e.message ?: "Unknown error saat memproses data. Worker Python dihentikan agar bisa start ulang dengan aman."
+                        )
+                        runCatching { pythonClient.stop() }
+                        nextSeqToProcess[ch] = rawBuf.newestSeqExclusive()
+                        break
+                    }
 
                     if (resp.paramsVersion != paramsVersion) break
 
@@ -1236,6 +1414,18 @@ fun DesktopUI() {
                             }
 
                             SidebarSectionCard(
+                                title = "Motor Movement Summary",
+                                expanded = stepperCalcExpanded,
+                                onToggle = { stepperCalcExpanded = !stepperCalcExpanded }
+                            ) {
+                                StepperPreviewCard(
+                                    mode = mode,
+                                    angleOrDistanceText = angle,
+                                    speedText = speed
+                                )
+                            }
+
+                            SidebarSectionCard(
                                 title = "Filter Settings",
                                 expanded = filterExpanded,
                                 onToggle = { filterExpanded = !filterExpanded }
@@ -1450,7 +1640,6 @@ fun DesktopUI() {
                                             )
                                         } else if (connected) {
                                             runEpoch.incrementAndGet()
-                                            pythonClient.stop()
                                             sensorMessagesList.clear()
 
                                             rawBufByChannel.clear()
@@ -1465,7 +1654,7 @@ fun DesktopUI() {
 
                                             kalmanXByChannel.clear()
                                             kalmanPByChannel.clear()
-                                            droppedFirstSampleRep1 = false
+                                            droppedStartupSampleByChannel.clear()
 
                                             savedForThisRun = false
                                             runDone = false
@@ -1483,7 +1672,16 @@ fun DesktopUI() {
                                             sensorMessagesList.add("[CMD] $cmd")
                                             if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
 
-                                            MQTTClient.publish(cmd)
+                                            runCatching {
+                                                MQTTClient.publish(cmd)
+                                            }.onFailure { e ->
+                                                dialogInfo = UiDialogInfo(
+                                                    "Gagal mengirim command",
+                                                    e.message ?: "Unknown error saat publish command MQTT."
+                                                )
+                                                sensorMessagesList.add("[PUBLISH ERROR] ${e.message ?: e::class.simpleName ?: "Unknown error"}")
+                                                if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+                                            }
                                         } else {
                                             dialogInfo = UiDialogInfo(
                                                 "Belum terhubung",
