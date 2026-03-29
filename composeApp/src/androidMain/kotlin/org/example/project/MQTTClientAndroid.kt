@@ -4,12 +4,6 @@ import org.eclipse.paho.client.mqttv3.*
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 
 actual object MQTTClient {
-    private const val broker = "ssl://358587e8751a4fbf8655e5a2fb5be16c.s1.eu.hivemq.cloud:8883"
-    private const val clientId = "InterferometerKMPClient"
-    private const val username = "MinusCool"
-    private const val password = "Interfero123"
-    private const val topic = "motor/commands"
-
     private val persistence = MemoryPersistence()
     private var mqttClient: MqttClient? = null
 
@@ -17,11 +11,11 @@ actual object MQTTClient {
 
     actual fun connect() {
         try {
-            mqttClient = MqttClient(broker, clientId, persistence)
+            mqttClient = MqttClient(MQTTConfig.broker, MQTTConfig.clientId, persistence)
             val connOpts = MqttConnectOptions().apply {
                 isCleanSession = true
-                userName = username
-                password = this@MQTTClient.password.toCharArray()
+                userName = MQTTConfig.username
+                password = MQTTConfig.password.toCharArray()
             }
 
             mqttClient?.setCallback(object : MqttCallback {
@@ -40,10 +34,10 @@ actual object MQTTClient {
                 }
             })
 
-            println("Connecting to broker: $broker")
+            println("Connecting to broker: $MQTTConfig.broker")
             mqttClient?.connect(connOpts)
-            mqttClient?.subscribe(topic)  // Subscribe ke topik saat connect
-            println("Connected and subscribed to $topic")
+            mqttClient?.subscribe(MQTTConfig.topic)  // Subscribe ke topik saat connect
+            println("Connected and subscribed to $MQTTConfig.topic")
 
         } catch (e: MqttException) {
             println("Error Connecting: ${e.message}")
@@ -61,7 +55,7 @@ actual object MQTTClient {
 
     actual fun publish(message: String) {
         try {
-            mqttClient?.publish(topic, MqttMessage(message.toByteArray()))
+            mqttClient?.publish(MQTTConfig.topic, MqttMessage(message.toByteArray()))
             println("Message published: $message")
         } catch (e: MqttException) {
             println("Error Publishing: ${e.message}")
