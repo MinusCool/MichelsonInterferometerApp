@@ -28,6 +28,7 @@ except Exception:
 _kalman_state = {}   # ch -> (x, P)
 _last_version = {}   # ch -> paramsVersion
 _filtered_history = {}  # ch -> {"version": int, "values": list[float]}
+_raw_history = {}  # ch -> {"version": int, "values": list[float]}
 
 
 # =========================================================
@@ -217,6 +218,8 @@ def update_global_peak_count(
     rel_height: float = 0.15,
     rel_prominence: float = 0.08,
     prominence_window: int = 12,
+    startup_trim_enabled: bool = False,
+    startup_trim_samples: int = 0,
 ) -> int:
     state = _filtered_history.get(ch)
     if state is None or int(state.get("version", -1)) != version:
@@ -227,6 +230,10 @@ def update_global_peak_count(
         state["values"].extend(np.asarray(y_chunk, dtype=np.float64).tolist())
 
     values = np.asarray(state["values"], dtype=np.float64)
+    if startup_trim_enabled:
+        trim_idx = int(max(0, startup_trim_samples))
+        values = values[trim_idx:] if trim_idx < values.size else np.array([], dtype=np.float64)
+
     return count_fringes_from_peaks(
         values,
         min_peak_distance=min_peak_distance,
@@ -235,6 +242,21 @@ def update_global_peak_count(
         prominence_window=prominence_window,
     )
 
+
+def update_raw_history(
+    ch: int,
+    version: int,
+    raw_chunk: np.ndarray,
+) -> np.ndarray:
+    state = _raw_history.get(ch)
+    if state is None or int(state.get("version", -1)) != version:
+        state = {"version": version, "values": []}
+        _raw_history[ch] = state
+
+    if raw_chunk.size:
+        state["values"].extend(np.asarray(raw_chunk, dtype=np.float64).tolist())
+
+    return np.asarray(state["values"], dtype=np.float64)
 
 # =========================================================
 # FFT HELPERS
@@ -520,7 +542,7 @@ def _fig_to_base64(fig) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def render_signal_plot(raw: np.ndarray, filtered: np.ndarray, start, end_exclusive, channel: int):
+def render_signal_plot(raw: np.ndarray, filtered: np.ndarray, start, end_exclusive, channel: int, startup_trim_enabled: bool = False, startup_trim_samples: int = 0):
     total = max(raw.size, filtered.size)
     if total < 2:
         raise RuntimeError("Not enough signal data to render plot")
@@ -540,7 +562,13 @@ def render_signal_plot(raw: np.ndarray, filtered: np.ndarray, start, end_exclusi
     peak_count = 0
     if filt_slice.size:
         ax.plot(x_filt, filt_slice, linewidth=1.2, label="Filtered")
-        peak_idx = detect_peaks_on_filtered(filt_slice)
+        trim_idx = int(max(0, startup_trim_samples)) if startup_trim_enabled else 0
+        if trim_idx > 0 and x_filt.size:
+            trim_end = min(trim_idx, filt_slice.size)
+            if trim_end > 0:
+                ax.axvspan(float(x_filt[0]), float(x_filt[trim_end - 1]), alpha=0.08, label="Startup trim")
+        trimmed_slice = filt_slice[trim_idx:] if trim_idx < filt_slice.size else np.array([], dtype=np.float64)
+        peak_idx = detect_peaks_on_filtered(trimmed_slice) + trim_idx if trimmed_slice.size else np.array([], dtype=np.int64)
         peak_count = int(len(peak_idx))
         if peak_idx.size:
             peak_x = x_filt[peak_idx]
@@ -613,11 +641,13 @@ def handle_render_plot(req: dict) -> dict:
     plot_kind = str(req.get("plotKind", "signal"))
     start = req.get("viewStartIndex")
     end_exclusive = req.get("viewEndExclusive")
+    startup_trim_enabled = bool(req.get("startupTrimEnabled", False))
+    startup_trim_samples = int(req.get("startupTrimSamples", 0))
 
     if plot_kind == "signal":
         raw = np.array(req.get("raw", []), dtype=np.float64)
         filtered = np.array(req.get("filtered", []), dtype=np.float64)
-        image_base64 = render_signal_plot(raw, filtered, start, end_exclusive, ch)
+        image_base64 = render_signal_plot(raw, filtered, start, end_exclusive, ch, startup_trim_enabled=startup_trim_enabled, startup_trim_samples=startup_trim_samples)
     elif plot_kind == "fft":
         freq = np.array(req.get("fftFreq", []), dtype=np.float64)
         spec = np.array(req.get("fftSpec", []), dtype=np.float64)
@@ -654,6 +684,8 @@ def handle(req: dict) -> dict:
     fft_fmax = float(params.get("fftFmax", 120.0))
     fft_zero_pad_factor = int(params.get("fftZeroPadFactor", 8))
     fft_use_auto_band = bool(params.get("fftUseAutoBand", True))
+    startup_trim_enabled = bool(params.get("startupTrimEnabled", False))
+    startup_trim_samples = int(params.get("startupTrimSamples", 0))
 
     if chunk.size == 0:
         return {
@@ -689,7 +721,7 @@ def handle(req: dict) -> dict:
     # selected filter.
     analysis_signal = combined_raw
 
-    peak_count = update_global_peak_count(ch, version, y_chunk)
+    peak_count = update_global_peak_count(ch, version, y_chunk, startup_trim_enabled=startup_trim_enabled, startup_trim_samples=startup_trim_samples)
 
     fft_result = {
         "fftDominantFreq": None,
@@ -699,8 +731,13 @@ def handle(req: dict) -> dict:
     }
 
     if fft_enabled:
+        fft_signal = analysis_signal
+        if startup_trim_enabled:
+            raw_history = update_raw_history(ch, version, chunk.astype(np.float64, copy=False))
+            trim_idx = int(max(0, startup_trim_samples))
+            fft_signal = raw_history[trim_idx:] if trim_idx < raw_history.size else np.array([], dtype=np.float64)
         fft_result = compute_fft_summary(
-            signal=analysis_signal,
+            signal=fft_signal,
             record_duration_sec=record_duration_sec,
             fft_fmin=fft_fmin,
             fft_fmax=fft_fmax,

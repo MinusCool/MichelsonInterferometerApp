@@ -599,7 +599,9 @@ private fun PythonSignalPlotSection(
     paramsVersion: Long,
     channel: Int?,
     rawSnapshot: List<Int>,
-    filteredSnapshot: List<Double>
+    filteredSnapshot: List<Double>,
+    startupTrimEnabled: Boolean,
+    startupTrimSamples: Int
 ) {
     if (channel == null) {
         Text("No repetition data yet.", color = PremiumTokens.TextMuted)
@@ -625,7 +627,9 @@ private fun PythonSignalPlotSection(
         window.start,
         window.endExclusive,
         raw.size,
-        filtered.size
+        filtered.size,
+        startupTrimEnabled,
+        startupTrimSamples
     ) {
         value = withContext(Dispatchers.IO) {
             processor.renderPlot(
@@ -636,6 +640,8 @@ private fun PythonSignalPlotSection(
                 filtered = filtered,
                 fftFreq = doubleArrayOf(),
                 fftSpec = doubleArrayOf(),
+                startupTrimEnabled = startupTrimEnabled,
+                startupTrimSamples = startupTrimSamples,
                 viewStartIndex = window.start,
                 viewEndExclusive = window.endExclusive
             ).imageBase64
@@ -708,7 +714,9 @@ private fun PythonFftPlotSection(
     paramsVersion: Long,
     channel: Int?,
     fftFreq: DoubleArray,
-    fftSpec: DoubleArray
+    fftSpec: DoubleArray,
+    startupTrimEnabled: Boolean,
+    startupTrimSamples: Int
 ) {
     if (channel == null) {
         Text("No FFT data yet.", color = PremiumTokens.TextMuted)
@@ -732,7 +740,9 @@ private fun PythonFftPlotSection(
         window.start,
         window.endExclusive,
         fftFreq.size,
-        fftSpec.size
+        fftSpec.size,
+        startupTrimEnabled,
+        startupTrimSamples
     ) {
         value = withContext(Dispatchers.IO) {
             processor.renderPlot(
@@ -743,6 +753,8 @@ private fun PythonFftPlotSection(
                 filtered = doubleArrayOf(),
                 fftFreq = fftFreq,
                 fftSpec = fftSpec,
+                startupTrimEnabled = startupTrimEnabled,
+                startupTrimSamples = startupTrimSamples,
                 viewStartIndex = window.start,
                 viewEndExclusive = window.endExclusive
             ).imageBase64
@@ -862,6 +874,11 @@ fun DesktopUI() {
     var appliedKalmanQ by remember { mutableStateOf(kalmanQ.toDouble()) }
     var appliedKalmanR by remember { mutableStateOf(kalmanR.toDouble()) }
 
+    var startupTrimEnabled by remember { mutableStateOf(false) }
+    var startupTrimSamplesText by remember { mutableStateOf("0") }
+    var appliedStartupTrimEnabled by remember { mutableStateOf(false) }
+    var appliedStartupTrimSamples by remember { mutableStateOf(0) }
+
     var paramsVersion by remember { mutableStateOf(0L) }
 
     val filters = listOf("SG", "Kalman")
@@ -903,7 +920,7 @@ fun DesktopUI() {
     var uiTick by remember { mutableStateOf(0L) }
     var procTick by remember { mutableStateOf(0L) }
 
-    val droppedStartupSampleByChannel = remember { mutableStateMapOf<Int, Boolean>() }
+    var droppedFirstSampleRep1 by remember { mutableStateOf(false) }
     var savedForThisRun by remember { mutableStateOf(false) }
     var runDone by remember { mutableStateOf(false) }
     var savingCsv by remember { mutableStateOf(false) }
@@ -1009,11 +1026,8 @@ fun DesktopUI() {
                     sensorMessagesList.add("$channel:$value")
                     if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
 
-                    val alreadyDropped = droppedStartupSampleByChannel[channel] == true
-                    if (!alreadyDropped) {
-                        droppedStartupSampleByChannel[channel] = true
-                        sensorMessagesList.add("[SUPPRESS] startup outlier skipped for repetition $channel: $value")
-                        if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+                    if (channel == 1 && !droppedFirstSampleRep1) {
+                        droppedFirstSampleRep1 = true
                         continue
                     }
 
@@ -1058,9 +1072,10 @@ fun DesktopUI() {
                 fftFmin = fftFmin,
                 fftFmax = fftFmax,
                 fftZeroPadFactor = fftZeroPadFactor,
-                fftUseAutoBand = fftUseAutoBand
+                fftUseAutoBand = fftUseAutoBand,
+                startupTrimEnabled = appliedStartupTrimEnabled,
+                startupTrimSamples = appliedStartupTrimSamples
             )
-
             var processedAny = false
 
             for (ch in rawBufByChannel.keys.sorted()) {
@@ -1083,25 +1098,13 @@ fun DesktopUI() {
                     val tailLen = max(filterOverlap, analysisLookback)
                     val tail = if (tailLen > 0) rawBuf.readChunk(seq - tailLen, tailLen) else IntArray(0)
 
-                    val resp = try {
-                        processor.process(
-                            channel = ch,
-                            seqStart = seq,
-                            rawTail = tail,
-                            rawChunk = chunk,
-                            params = params
-                        )
-                    } catch (e: Throwable) {
-                        sensorMessagesList.add("[PROCESS ERROR][rep $ch] ${e.message ?: e::class.simpleName ?: "Unknown error"}")
-                        if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-                        dialogInfo = UiDialogInfo(
-                            "Processing error",
-                            e.message ?: "Unknown error saat memproses data. Worker Python dihentikan agar bisa start ulang dengan aman."
-                        )
-                        runCatching { pythonClient.stop() }
-                        nextSeqToProcess[ch] = rawBuf.newestSeqExclusive()
-                        break
-                    }
+                    val resp = processor.process(
+                        channel = ch,
+                        seqStart = seq,
+                        rawTail = tail,
+                        rawChunk = chunk,
+                        params = params
+                    )
 
                     if (resp.paramsVersion != paramsVersion) break
 
@@ -1300,7 +1303,9 @@ fun DesktopUI() {
                                             paramsVersion = paramsVersion,
                                             channel = selectedPlotRep,
                                             fftFreq = fftFreqMapForPlot[selectedPlotRep] ?: doubleArrayOf(),
-                                            fftSpec = fftSpecMapForPlot[selectedPlotRep] ?: doubleArrayOf()
+                                            fftSpec = fftSpecMapForPlot[selectedPlotRep] ?: doubleArrayOf(),
+                                            startupTrimEnabled = appliedStartupTrimEnabled,
+                                            startupTrimSamples = appliedStartupTrimSamples
                                         )
                                     } else {
                                         PythonSignalPlotSection(
@@ -1308,7 +1313,9 @@ fun DesktopUI() {
                                             paramsVersion = paramsVersion,
                                             channel = selectedPlotRep,
                                             rawSnapshot = rawMapForPlot[selectedPlotRep].orEmpty(),
-                                            filteredSnapshot = filteredMapForPlot[selectedPlotRep].orEmpty()
+                                            filteredSnapshot = filteredMapForPlot[selectedPlotRep].orEmpty(),
+                                            startupTrimEnabled = appliedStartupTrimEnabled,
+                                            startupTrimSamples = appliedStartupTrimSamples
                                         )
                                     }
                                 }
@@ -1517,6 +1524,76 @@ fun DesktopUI() {
                             }
 
                             SidebarSectionCard(
+                                title = "Startup Trim",
+                                expanded = true,
+                                onToggle = {},
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("Enable manual startup trim", color = PremiumTokens.Text, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                        Spacer(Modifier.height(2.dp))
+                                        Text("Saat off, analisis tetap seperti sebelumnya.", color = PremiumTokens.TextMuted, fontSize = 11.sp)
+                                    }
+                                    Switch(
+                                        checked = startupTrimEnabled,
+                                        onCheckedChange = { startupTrimEnabled = it },
+                                        colors = SwitchDefaults.colors(
+                                            checkedThumbColor = PremiumTokens.Primary,
+                                            checkedTrackColor = PremiumTokens.PrimarySoft
+                                        )
+                                    )
+                                }
+
+                                Spacer(Modifier.height(10.dp))
+
+                                OutlinedTextField(
+                                    value = startupTrimSamplesText,
+                                    onValueChange = { newValue: String ->
+                                        if (newValue.isEmpty() || newValue.all(Char::isDigit)) {
+                                            startupTrimSamplesText = newValue
+                                        } else {
+                                            dialogInfo = UiDialogInfo(
+                                                "Input tidak valid — Startup Trim",
+                                                "Nilai Trim samples harus berupa angka bulat non-negatif."
+                                            )
+                                        }
+                                    },
+                                    label = { Text("Trim samples") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    enabled = startupTrimEnabled,
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = PremiumTokens.Primary,
+                                        unfocusedBorderColor = PremiumTokens.Border,
+                                        focusedLabelColor = PremiumTokens.Primary,
+                                        unfocusedLabelColor = PremiumTokens.TextMuted,
+                                        cursorColor = PremiumTokens.Primary,
+                                        focusedTextColor = PremiumTokens.Text,
+                                        unfocusedTextColor = PremiumTokens.Text,
+                                        disabledBorderColor = PremiumTokens.Border,
+                                        disabledTextColor = PremiumTokens.TextMuted
+                                    ),
+                                    shape = RoundedCornerShape(14.dp)
+                                )
+
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    text = if (startupTrimEnabled) {
+                                        val n = startupTrimSamplesText.toIntOrNull()?.coerceAtLeast(0) ?: 0
+                                        "Applied on next Start: skip $n sample(s) at the beginning for plotting, peak count, and FFT."
+                                    } else {
+                                        "Startup trim is disabled."
+                                    },
+                                    color = PremiumTokens.TextMuted,
+                                    fontSize = 11.sp
+                                )
+                            }
+
+                            SidebarSectionCard(
                                 title = "FFT Analysis",
                                 expanded = fftExpanded,
                                 onToggle = { fftExpanded = !fftExpanded }
@@ -1640,6 +1717,7 @@ fun DesktopUI() {
                                             )
                                         } else if (connected) {
                                             runEpoch.incrementAndGet()
+                                            pythonClient.stop()
                                             sensorMessagesList.clear()
 
                                             rawBufByChannel.clear()
@@ -1654,11 +1732,18 @@ fun DesktopUI() {
 
                                             kalmanXByChannel.clear()
                                             kalmanPByChannel.clear()
-                                            droppedStartupSampleByChannel.clear()
+                                            droppedFirstSampleRep1 = false
 
                                             savedForThisRun = false
                                             runDone = false
                                             savingCsv = false
+
+                                            appliedStartupTrimEnabled = startupTrimEnabled
+                                            appliedStartupTrimSamples = if (startupTrimEnabled) {
+                                                startupTrimSamplesText.toIntOrNull()?.coerceAtLeast(0) ?: 0
+                                            } else {
+                                                0
+                                            }
 
                                             uiTick++
                                             procTick++
@@ -1672,16 +1757,7 @@ fun DesktopUI() {
                                             sensorMessagesList.add("[CMD] $cmd")
                                             if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
 
-                                            runCatching {
-                                                MQTTClient.publish(cmd)
-                                            }.onFailure { e ->
-                                                dialogInfo = UiDialogInfo(
-                                                    "Gagal mengirim command",
-                                                    e.message ?: "Unknown error saat publish command MQTT."
-                                                )
-                                                sensorMessagesList.add("[PUBLISH ERROR] ${e.message ?: e::class.simpleName ?: "Unknown error"}")
-                                                if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-                                            }
+                                            MQTTClient.publish(cmd)
                                         } else {
                                             dialogInfo = UiDialogInfo(
                                                 "Belum terhubung",

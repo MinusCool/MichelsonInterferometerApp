@@ -89,12 +89,20 @@ class LocalProcessorClient(
             "Kalman" -> localKalman(channel, rawChunk, params.kalmanQ, params.kalmanR)
             else -> rawChunk.map { it.toDouble() }.toDoubleArray()
         }
+        val filteredForPeaks = if (params.startupTrimEnabled) {
+            val trim = params.startupTrimSamples.coerceAtLeast(0)
+            when {
+                trim <= 0 -> filtered
+                trim >= filtered.size -> doubleArrayOf()
+                else -> filtered.copyOfRange(trim, filtered.size)
+            }
+        } else filtered
         return ProcResponse(
             channel = channel,
             seqStart = seqStart,
             paramsVersion = params.version,
             filtered = filtered,
-            peakCount = estimatePeaks(filtered),
+            peakCount = estimatePeaks(filteredForPeaks),
             fftDominantFreq = null,
             fftDominantAmp = null,
             fftFreq = doubleArrayOf(),
@@ -105,6 +113,8 @@ class LocalProcessorClient(
     override fun renderPlot(
         channel: Int,
         paramsVersion: Long,
+        startupTrimEnabled: Boolean,
+        startupTrimSamples: Int,
         plotKind: PlotKind,
         raw: IntArray,
         filtered: DoubleArray,

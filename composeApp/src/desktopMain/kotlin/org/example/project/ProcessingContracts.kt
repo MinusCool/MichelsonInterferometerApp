@@ -13,6 +13,8 @@ interface ProcessorClient {
     fun renderPlot(
         channel: Int,
         paramsVersion: Long,
+        startupTrimEnabled: Boolean,
+        startupTrimSamples: Int,
         plotKind: PlotKind,
         raw: IntArray,
         filtered: DoubleArray,
@@ -35,7 +37,9 @@ data class ProcParams(
     val fftFmin: Double,
     val fftFmax: Double,
     val fftZeroPadFactor: Int,
-    val fftUseAutoBand: Boolean
+    val fftUseAutoBand: Boolean,
+    val startupTrimEnabled: Boolean,
+    val startupTrimSamples: Int
 )
 
 data class ProcResponse(

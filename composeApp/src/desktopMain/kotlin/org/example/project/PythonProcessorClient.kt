@@ -24,7 +24,9 @@ data class PyProcParams(
     val fftFmin: Double,
     val fftFmax: Double,
     val fftZeroPadFactor: Int,
-    val fftUseAutoBand: Boolean
+    val fftUseAutoBand: Boolean,
+    val startupTrimEnabled: Boolean,
+    val startupTrimSamples: Int
 )
 
 @Serializable
@@ -58,6 +60,8 @@ data class PyRenderPlotRequest(
     val type: String = "render_plot",
     val channel: Int,
     val paramsVersion: Long,
+    val startupTrimEnabled: Boolean,
+    val startupTrimSamples: Int,
     val plotKind: String,
     val raw: IntArray = intArrayOf(),
     val filtered: DoubleArray = doubleArrayOf(),
@@ -245,7 +249,9 @@ class PythonProcessorClient(
                 fftFmin = params.fftFmin,
                 fftFmax = params.fftFmax,
                 fftZeroPadFactor = params.fftZeroPadFactor,
-                fftUseAutoBand = params.fftUseAutoBand
+                fftUseAutoBand = params.fftUseAutoBand,
+                startupTrimEnabled = params.startupTrimEnabled,
+                startupTrimSamples = params.startupTrimSamples
             ),
             tail = rawTail,
             chunk = rawChunk
@@ -274,6 +280,8 @@ class PythonProcessorClient(
     override fun renderPlot(
         channel: Int,
         paramsVersion: Long,
+        startupTrimEnabled: Boolean,
+        startupTrimSamples: Int,
         plotKind: PlotKind,
         raw: IntArray,
         filtered: DoubleArray,
@@ -287,6 +295,8 @@ class PythonProcessorClient(
         val req = PyRenderPlotRequest(
             channel = channel,
             paramsVersion = paramsVersion,
+            startupTrimEnabled = startupTrimEnabled,
+            startupTrimSamples = startupTrimSamples,
             plotKind = plotKind.wireValue,
             raw = raw,
             filtered = filtered,
