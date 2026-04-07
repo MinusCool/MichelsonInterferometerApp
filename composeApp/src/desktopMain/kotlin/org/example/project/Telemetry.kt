@@ -19,7 +19,9 @@ data class PacketTelemetryRecord(
     val bytesOnWire: Int,          // len(payload) for all variants
     val decodeUs: Long,            // parse + decode + store
     val crcOk: Boolean? = null,
-    val lenOk: Boolean? = null
+    val lenOk: Boolean? = null,
+    val accepted: Boolean,
+    val writtenSamples: Int
 )
 
 data class RepTelemetryStats(
@@ -103,6 +105,15 @@ private fun percentile(xs: List<Double>, p: Double): Double {
     return d0 + d1
 }
 
+private fun recordDurationFallbackSec(validPackets: List<PacketTelemetryRecord>): Double {
+    if (validPackets.isEmpty()) return 1e-6
+    if (validPackets.size == 1) return 1e-3
+
+    val recvSorted = validPackets.sortedBy { it.tRecvMonoUs }
+    val dtUs = (recvSorted.last().tRecvMonoUs - recvSorted.first().tRecvMonoUs).toDouble()
+    return maxOf(1e-6, dtUs / 1_000_000.0)
+}
+
 fun buildPerRepTelemetrySummaries(records: List<PacketTelemetryRecord>): List<RepTelemetrySummary> {
     if (records.isEmpty()) return emptyList()
 
@@ -111,35 +122,14 @@ fun buildPerRepTelemetrySummaries(records: List<PacketTelemetryRecord>): List<Re
         .toSortedMap()
         .map { (repId, repRecords) ->
             val packetList = repRecords.sortedBy { it.tRecvMonoUs }
+            val validPackets = packetList.filter { it.accepted && it.writtenSamples > 0 }
 
             val rs = RepTelemetryStats(repId = repId)
             packetList.forEach { p ->
                 rs.packets += 1
-                rs.samples += p.sampleCount * p.channelCount
+                rs.samples += p.writtenSamples
                 rs.updateSeq(p.seq)
             }
-
-            val anchorSend = packetList.first().tSendUs
-            val anchorRecvMono = packetList.first().tRecvMonoUs
-
-            val lRel = packetList.map { p ->
-                ((p.tRecvMonoUs - anchorRecvMono) - (p.tSendUs - anchorSend)).toDouble()
-            }
-
-            val d = packetList.map { it.decodeUs.toDouble() }
-            val s = packetList.map { it.bytesOnWire.toDouble() }
-
-            val p50L = percentile(lRel, 50.0)
-            val p99L = percentile(lRel, 99.0)
-            val p50D = percentile(d, 50.0)
-            val p99D = percentile(d, 99.0)
-
-            val t0 = packetList.first().tRecvMonoUs
-            val t1 = packetList.last().tRecvMonoUs
-            val dtSec = maxOf(1e-6, (t1 - t0).toDouble() / 1_000_000.0)
-
-            val totalSamples = packetList.sumOf { (it.sampleCount * it.channelCount).toLong() }
-            val throughput = totalSamples / dtSec
 
             val crcBad = packetList.count { it.crcOk == false }
             val lenBad = packetList.count { it.lenOk == false }
@@ -152,6 +142,62 @@ fun buildPerRepTelemetrySummaries(records: List<PacketTelemetryRecord>): List<Re
             } else {
                 Double.NaN
             }
+
+            if (validPackets.isEmpty()) {
+                val dAll = packetList.map { it.decodeUs.toDouble() }
+                return@map RepTelemetrySummary(
+                    repId = repId,
+                    packets = packetList.size,
+                    totalSamples = 0,
+                    avgBytesOnWire = packetList.map { it.bytesOnWire.toDouble() }.average(),
+                    latencyP50Us = Double.NaN,
+                    latencyP99Us = Double.NaN,
+                    latencyJitterUs = Double.NaN,
+                    decodeP50Us = percentile(dAll, 50.0),
+                    decodeP99Us = percentile(dAll, 99.0),
+                    decodeJitterUs = percentile(dAll, 99.0) - percentile(dAll, 50.0),
+                    throughputSamplesPerSec = 0.0,
+                    crcBad = crcBad,
+                    lenBad = lenBad,
+                    q = q,
+                    durationSec = 0.0
+                )
+            }
+
+            val recvSorted = validPackets.sortedBy { it.tRecvMonoUs }
+
+            // Proposal: L = t_recv - t_send
+            // Karena offset antar clock dianggap konstan dalam satu sesi/repetisi,
+            // kita normalisasi terhadap offset paket valid pertama.
+            val rawLatencies = recvSorted.map { p ->
+                (p.tRecvMonoUs - p.tSendUs).toDouble()
+            }
+            val baseOffset = rawLatencies.first()
+            val l = rawLatencies.map { it - baseOffset }
+
+            val d = recvSorted.map { it.decodeUs.toDouble() }
+            val s = recvSorted.map { it.bytesOnWire.toDouble() }
+
+            val p50L = percentile(l, 50.0)
+            val p99L = percentile(l, 99.0)
+            val p50D = percentile(d, 50.0)
+            val p99D = percentile(d, 99.0)
+
+            val totalSamples = recvSorted.sumOf { it.writtenSamples.toLong() }
+
+            // Proposal: R = N_samples / T
+            // T dipakai sebagai durasi pengujian repetisi pada sisi penerima,
+            // bukan active send window.
+            val dtSec = if (recvSorted.size >= 2) {
+                maxOf(
+                    1e-6,
+                    (recvSorted.last().tRecvMonoUs - recvSorted.first().tRecvMonoUs).toDouble() / 1_000_000.0
+                )
+            } else {
+                1e-6
+            }
+
+            val throughput = totalSamples / dtSec
 
             RepTelemetrySummary(
                 repId = repId,
@@ -228,7 +274,7 @@ fun exportPacketTelemetryCsv(records: List<PacketTelemetryRecord>): File {
     file.bufferedWriter().use { w ->
         w.appendLine(
             "variant,rep_id,seq,t_send_us,t_recv_epoch_us,t_recv_mono_us," +
-                    "sample_count,channel_count,sample_fmt,bytes_on_wire,decode_us,crc_ok,len_ok"
+                    "sample_count,channel_count,sample_fmt,bytes_on_wire,decode_us,crc_ok,len_ok,accepted,written_samples"
         )
         records.forEach { r ->
             w.appendLine(
@@ -245,7 +291,9 @@ fun exportPacketTelemetryCsv(records: List<PacketTelemetryRecord>): File {
                     r.bytesOnWire,
                     r.decodeUs,
                     r.crcOk?.toString() ?: "",
-                    r.lenOk?.toString() ?: ""
+                    r.lenOk?.toString() ?: "",
+                    r.accepted,
+                    r.writtenSamples
                 ).joinToString(",")
             )
         }

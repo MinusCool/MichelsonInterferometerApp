@@ -1287,7 +1287,9 @@ fun DesktopUI() {
                     bytesOnWire = decoded.payloadBytes,
                     decodeUs = decodeUs,
                     crcOk = decoded.crcOk,
-                    lenOk = decoded.lenOk
+                    lenOk = decoded.lenOk,
+                    accepted = false,
+                    writtenSamples = 0
                 )
 
                 appendSensorLog(
@@ -1322,7 +1324,9 @@ fun DesktopUI() {
                 bytesOnWire = decoded.payloadBytes,
                 decodeUs = decodeUs,
                 crcOk = decoded.crcOk,
-                lenOk = decoded.lenOk
+                lenOk = decoded.lenOk,
+                accepted = writtenSamples > 0,
+                writtenSamples = writtenSamples
             )
 
             if (writtenSamples <= 0) continue
