@@ -185,18 +185,11 @@ fun decodeInt16LeInto(
     sampleCount: Int,
     sink: IntRingBuffer
 ) {
-    if (sampleCount <= 0) return
-    val requiredBytes = sampleCount * 2
-    require(offset >= 0) { "offset must be >= 0" }
-    require(offset + requiredBytes <= src.size) { "decodeInt16LeInto out of bounds" }
-
-    var p = offset
-    repeat(sampleCount) {
-        val lo = src[p].toInt() and 0xFF
-        val hi = src[p + 1].toInt()
-        sink.append(((hi shl 8) or lo).toShort().toInt())
-        p += 2
-    }
+    sink.appendDecodedInt16LeFromByteArray(
+        src = src,
+        offset = offset,
+        sampleCount = sampleCount
+    )
 }
 
 fun decodeInt16LeIntoCount(
@@ -205,19 +198,11 @@ fun decodeInt16LeIntoCount(
     sampleCount: Int,
     sink: IntRingBuffer
 ): Int {
-    if (sampleCount <= 0) return 0
-    val requiredBytes = sampleCount * 2
-    require(offset >= 0) { "offset must be >= 0" }
-    require(offset + requiredBytes <= src.size) { "decodeInt16LeIntoCount out of bounds" }
-
-    var p = offset
-    repeat(sampleCount) {
-        val lo = src[p].toInt() and 0xFF
-        val hi = src[p + 1].toInt()
-        sink.append(((hi shl 8) or lo).toShort().toInt())
-        p += 2
-    }
-    return sampleCount
+    return sink.appendDecodedInt16LeFromByteArray(
+        src = src,
+        offset = offset,
+        sampleCount = sampleCount
+    )
 }
 
 fun decodeControlText(payload: ByteArray): String =

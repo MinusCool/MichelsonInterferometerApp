@@ -40,6 +40,8 @@ import java.util.Base64
 import java.util.concurrent.atomic.AtomicLong
 import org.jetbrains.skia.Image as SkiaImage
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.CompletableDeferred
+import java.util.concurrent.ConcurrentHashMap
 
 
 private fun detectFilteredPeakIndicesGlobal(
@@ -298,6 +300,50 @@ private data class IncomingMqttFrame(
     val tRecvEpochUs: Long,
     val tRecvMonoUs: Long
 )
+
+private data class ClockSyncAck(
+    val id: Long,
+    val t1PcUs: Long,
+    val t2EspUs: Long,
+    val t3EspUs: Long,
+    val t4PcUs: Long
+) {
+    val rttUs: Long
+        get() = ((t4PcUs - t1PcUs) - (t3EspUs - t2EspUs)).coerceAtLeast(0L)
+
+    // theta = ((t2 - t1) + (t3 - t4)) / 2
+    // artinya clock ESP = clock PC + theta
+    val espMinusPcOffsetUs: Long
+        get() = ((t2EspUs - t1PcUs) + (t3EspUs - t4PcUs)) / 2L
+}
+
+private fun parseClockSyncAck(message: String, t4PcUs: Long): ClockSyncAck? {
+    if (!message.startsWith("SYNC_ACK:", ignoreCase = true)) return null
+
+    val tail = message.substringAfter("SYNC_ACK:")
+    val parts = tail.split(";").map { it.trim() }.filter { it.isNotEmpty() }
+
+    val kv = mutableMapOf<String, String>()
+    for (p in parts) {
+        val idx = p.indexOf('=')
+        if (idx > 0) {
+            kv[p.substring(0, idx).trim()] = p.substring(idx + 1).trim()
+        }
+    }
+
+    val id = kv["id"]?.toLongOrNull() ?: return null
+    val t1 = kv["t1_pc_us"]?.toLongOrNull() ?: return null
+    val t2 = kv["t2_esp_us"]?.toLongOrNull() ?: return null
+    val t3 = kv["t3_esp_us"]?.toLongOrNull() ?: return null
+
+    return ClockSyncAck(
+        id = id,
+        t1PcUs = t1,
+        t2EspUs = t2,
+        t3EspUs = t3,
+        t4PcUs = t4PcUs
+    )
+}
 
 private fun decodePacketForUi(
     payload: ByteArray,
@@ -901,6 +947,9 @@ fun DesktopUI() {
 
     val runEpoch = remember { AtomicLong(0L) }
     val mqttQueue = remember { Channel<IncomingMqttFrame>(capacity = Channel.BUFFERED) }
+    val pendingClockSync = remember { ConcurrentHashMap<Long, CompletableDeferred<ClockSyncAck>>() }
+    var espMinusPcOffsetUs by remember { mutableStateOf<Long?>(null) }
+    var lastSyncRttUs by remember { mutableStateOf<Long?>(null) }
 
     var selectedVariantCode by remember { mutableStateOf(1) }
     var activeRunId by remember { mutableStateOf<Long?>(null) }
@@ -919,6 +968,7 @@ fun DesktopUI() {
     val fftFmax = 120.0
     val fftZeroPadFactor = 8
     val fftUseAutoBand = true
+    val isolateDecodeBenchmarkDuringRun = true
 
     val rawBufByChannel = remember { mutableStateMapOf<Int, IntRingBuffer>() }
     val filtBufByChannel = remember { mutableStateMapOf<Int, DoubleRingBuffer>() }
@@ -968,7 +1018,79 @@ fun DesktopUI() {
         if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
     }
 
-    fun startRunInternal(variantCode: Int): Boolean {
+    suspend fun synchronizeEspClock(
+        sampleCount: Int = 7,
+        timeoutPerSampleMs: Long = 2000L,
+        interSampleDelayMs: Long = 40L
+    ): Boolean {
+        if (!connected) {
+            dialogInfo = UiDialogInfo(
+                "Belum terhubung",
+                "Hubungkan MQTT terlebih dahulu sebelum sinkronisasi clock."
+            )
+            return false
+        }
+
+        val samples = mutableListOf<ClockSyncAck>()
+
+        repeat(sampleCount) {
+            val syncId = System.nanoTime()
+            val deferred = CompletableDeferred<ClockSyncAck>()
+            pendingClockSync[syncId] = deferred
+
+            val t1PcUs = System.nanoTime() / 1000L
+            val cmd = "SYNC_REQ:id=$syncId;t1_pc_us=$t1PcUs"
+
+            try {
+                MQTTClient.publish(cmd)
+            } catch (e: Exception) {
+                pendingClockSync.remove(syncId)
+                appendSensorLog("[SYNC] publish failed: ${e.message}")
+                return false
+            }
+
+            val ack = withTimeoutOrNull(timeoutPerSampleMs) {
+                deferred.await()
+            }
+
+            pendingClockSync.remove(syncId)
+
+            if (ack != null) {
+                samples += ack
+            }
+
+            delay(interSampleDelayMs)
+        }
+
+        if (samples.isEmpty()) {
+            dialogInfo = UiDialogInfo(
+                "Sinkronisasi clock gagal",
+                "Tidak ada SYNC_ACK yang diterima dari simulator/ESP."
+            )
+            return false
+        }
+
+        // Urutkan dari RTT terbaik, lalu ambil maksimal 3 terbaik dan median offset-nya
+        val ranked = samples.sortedBy { it.rttUs }
+        val best = ranked.take(minOf(3, ranked.size))
+        val offsets = best.map { it.espMinusPcOffsetUs }.sorted()
+
+        val medianOffset = when (offsets.size) {
+            1 -> offsets[0]
+            2 -> (offsets[0] + offsets[1]) / 2L
+            else -> offsets[offsets.size / 2]
+        }
+
+        espMinusPcOffsetUs = medianOffset
+        lastSyncRttUs = best.minOfOrNull { it.rttUs }
+
+        appendSensorLog(
+            "[SYNC] success: offset_esp_minus_pc=${medianOffset}us, best_rtt=${lastSyncRttUs ?: -1L}us, samples=${samples.size}"
+        )
+        return true
+    }
+
+    suspend fun startRunInternal(variantCode: Int): Boolean {
         if ((angle.toIntOrNull() == null && angle.isNotEmpty()) ||
             (speed.toIntOrNull() == null && speed.isNotEmpty()) ||
             (repetitions.toIntOrNull() == null && repetitions.isNotEmpty())
@@ -993,6 +1115,12 @@ fun DesktopUI() {
                 "Belum terhubung",
                 "Hubungkan MQTT terlebih dahulu sebelum menekan Start."
             )
+            return false
+        }
+
+        appendSensorLog("[SYNC] starting two-way clock synchronization...")
+        val syncOk = synchronizeEspClock()
+        if (!syncOk) {
             return false
         }
 
@@ -1214,6 +1342,12 @@ fun DesktopUI() {
             if (topic == MQTTConfig.topicCommand || topic == MQTTConfig.topicStatus) {
                 val messageText = decodeControlText(payload)
 
+                val syncAck = parseClockSyncAck(messageText, tRecvMonoUs)
+                if (syncAck != null) {
+                    pendingClockSync.remove(syncAck.id)?.complete(syncAck)
+                    continue
+                }
+
                 if (messageText.startsWith("ERR:", ignoreCase = true)) {
                     appendSensorLog("ERR seen on $topic: $messageText")
                     donePending = false
@@ -1281,6 +1415,7 @@ fun DesktopUI() {
                     tSendUs = decoded.tSendUs,
                     tRecvEpochUs = tRecvEpochUs,
                     tRecvMonoUs = tRecvMonoUs,
+                    espMinusPcOffsetUs = espMinusPcOffsetUs,
                     sampleCount = decoded.sampleCount,
                     channelCount = decoded.channelCount,
                     sampleFmt = decoded.sampleFmt,
@@ -1318,6 +1453,7 @@ fun DesktopUI() {
                 tSendUs = decoded.tSendUs,
                 tRecvEpochUs = tRecvEpochUs,
                 tRecvMonoUs = tRecvMonoUs,
+                espMinusPcOffsetUs = espMinusPcOffsetUs,
                 sampleCount = decoded.sampleCount,
                 channelCount = decoded.channelCount,
                 sampleFmt = decoded.sampleFmt,
@@ -1339,10 +1475,12 @@ fun DesktopUI() {
             }
             lastSeqByRep[decoded.repId] = decoded.seq
 
-            appendSensorLog(
-                "[PKT ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} " +
-                        "samples=$writtenSamples bytes=${decoded.payloadBytes} decode=${decodeUs}us"
-            )
+            if ((decoded.seq % 16L) == 0L) {
+                appendSensorLog(
+                    "[PKT ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} " +
+                            "samples=$writtenSamples bytes=${decoded.payloadBytes} decode=${decodeUs}us"
+                )
+            }
 
             val cur = nextSeqToProcess[decoded.repId]
             val processingStart = (buf.oldestSeq() + processingSkipFirstSamples)
@@ -1371,6 +1509,10 @@ fun DesktopUI() {
 
         while (isActive && connected) {
             delay(tickMs)
+
+            if (isolateDecodeBenchmarkDuringRun && runInProgress) {
+                continue
+            }
 
             val params = ProcParams(
                 version = paramsVersion,
@@ -2001,7 +2143,9 @@ fun DesktopUI() {
                             ) {
                                 Button(
                                     onClick = {
-                                        startRunInternal(selectedVariantCode)
+                                        scope.launch {
+                                            startRunInternal(selectedVariantCode)
+                                        }
                                     },
                                     modifier = Modifier.weight(2f),
                                     colors = ButtonDefaults.buttonColors(

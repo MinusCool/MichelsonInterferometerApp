@@ -16,6 +16,15 @@ class IntRingBuffer(private val capacity: Int) {
     private var size = 0
     private var oldestSeqValue = 0L
 
+    fun clear() {
+        head = 0
+        size = 0
+        oldestSeqValue = 0L
+    }
+
+    fun oldestSeq(): Long = oldestSeqValue
+    fun newestSeqExclusive(): Long = oldestSeqValue + size
+
     fun append(value: Int) {
         if (size < capacity) {
             val tail = (head + size) % capacity
@@ -29,22 +38,99 @@ class IntRingBuffer(private val capacity: Int) {
     }
 
     fun appendAll(values: IntArray, offset: Int = 0, length: Int = values.size - offset) {
-        if (length <= 0) return
+        if (values.isEmpty()) return
+
         val safeOffset = offset.coerceIn(0, values.size)
         val safeLength = length.coerceIn(0, values.size - safeOffset)
-        for (i in 0 until safeLength) {
-            append(values[safeOffset + i])
+        if (safeLength <= 0) return
+
+        if (safeLength >= capacity) {
+            val srcStart = safeOffset + safeLength - capacity
+            System.arraycopy(values, srcStart, data, 0, capacity)
+            oldestSeqValue = newestSeqExclusive() + safeLength - capacity
+            head = 0
+            size = capacity
+            return
+        }
+
+        makeRoomFor(safeLength)
+
+        val tail = (head + size) % capacity
+        val firstPart = min(safeLength, capacity - tail)
+        System.arraycopy(values, safeOffset, data, tail, firstPart)
+
+        val remaining = safeLength - firstPart
+        if (remaining > 0) {
+            System.arraycopy(values, safeOffset + firstPart, data, 0, remaining)
+        }
+
+        size += safeLength
+    }
+
+    fun appendDecodedInt16LeFromByteArray(
+        src: ByteArray,
+        offset: Int,
+        sampleCount: Int
+    ): Int {
+        if (sampleCount <= 0) return 0
+
+        val requiredBytes = sampleCount * 2
+        require(offset >= 0) { "offset must be >= 0" }
+        require(offset + requiredBytes <= src.size) { "appendDecodedInt16LeFromByteArray out of bounds" }
+
+        if (sampleCount >= capacity) {
+            val keep = capacity
+            val startSample = sampleCount - keep
+            val startOffset = offset + startSample * 2
+
+            oldestSeqValue = newestSeqExclusive() + sampleCount - keep
+            head = 0
+            size = keep
+
+            decodeIntoContiguous(src, startOffset, keep, physicalStart = 0)
+            return sampleCount
+        }
+
+        makeRoomFor(sampleCount)
+
+        val tail = (head + size) % capacity
+        val firstPart = min(sampleCount, capacity - tail)
+        decodeIntoContiguous(src, offset, firstPart, physicalStart = tail)
+
+        val remaining = sampleCount - firstPart
+        if (remaining > 0) {
+            decodeIntoContiguous(src, offset + firstPart * 2, remaining, physicalStart = 0)
+        }
+
+        size += sampleCount
+        return sampleCount
+    }
+
+    private fun makeRoomFor(incomingCount: Int) {
+        val discardCount = max(0, size + incomingCount - capacity)
+        if (discardCount > 0) {
+            head = (head + discardCount) % capacity
+            size -= discardCount
+            oldestSeqValue += discardCount.toLong()
         }
     }
 
-    fun clear() {
-        head = 0
-        size = 0
-        oldestSeqValue = 0L
+    private fun decodeIntoContiguous(
+        src: ByteArray,
+        byteOffset: Int,
+        sampleCount: Int,
+        physicalStart: Int
+    ) {
+        var p = byteOffset
+        var dst = physicalStart
+        repeat(sampleCount) {
+            val lo = src[p].toInt() and 0xFF
+            val hi = src[p + 1].toInt()
+            data[dst] = ((hi shl 8) or lo).toShort().toInt()
+            p += 2
+            dst++
+        }
     }
-
-    fun oldestSeq(): Long = oldestSeqValue
-    fun newestSeqExclusive(): Long = oldestSeqValue + size
 
     fun readChunk(seqStart: Long, maxCount: Int): IntArray {
         if (maxCount <= 0 || size == 0) return IntArray(0)
@@ -98,12 +184,38 @@ class DoubleRingBuffer(private val capacity: Int) {
     }
 
     fun appendAll(values: DoubleArray, offset: Int = 0, length: Int = values.size - offset) {
-        if (length <= 0) return
+        if (values.isEmpty()) return
+
         val safeOffset = offset.coerceIn(0, values.size)
         val safeLength = length.coerceIn(0, values.size - safeOffset)
-        for (i in 0 until safeLength) {
-            append(values[safeOffset + i])
+        if (safeLength <= 0) return
+
+        if (safeLength >= capacity) {
+            val srcStart = safeOffset + safeLength - capacity
+            System.arraycopy(values, srcStart, data, 0, capacity)
+            oldestSeqValue = newestSeqExclusive() + safeLength - capacity
+            head = 0
+            size = capacity
+            return
         }
+
+        val discardCount = max(0, size + safeLength - capacity)
+        if (discardCount > 0) {
+            head = (head + discardCount) % capacity
+            size -= discardCount
+            oldestSeqValue += discardCount.toLong()
+        }
+
+        val tail = (head + size) % capacity
+        val firstPart = min(safeLength, capacity - tail)
+        System.arraycopy(values, safeOffset, data, tail, firstPart)
+
+        val remaining = safeLength - firstPart
+        if (remaining > 0) {
+            System.arraycopy(values, safeOffset + firstPart, data, 0, remaining)
+        }
+
+        size += safeLength
     }
 
     fun clear() {
