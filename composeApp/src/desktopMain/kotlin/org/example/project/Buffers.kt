@@ -40,6 +40,8 @@ class IntRingBuffer(private val capacity: Int) {
         val list = data.toList()
         return if (list.size <= maxCount) list else list.takeLast(maxCount)
     }
+
+    fun snapshotAll(): List<Int> = data.toList()
 }
 
 class DoubleRingBuffer(private val capacity: Int) {
@@ -70,6 +72,8 @@ class DoubleRingBuffer(private val capacity: Int) {
         val list = data.toList()
         return if (list.size <= maxCount) list else list.takeLast(maxCount)
     }
+
+    fun snapshotAll(): List<Double> = data.toList()
 }
 
 class LocalProcessorClient(

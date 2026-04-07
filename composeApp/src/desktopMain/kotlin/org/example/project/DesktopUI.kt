@@ -598,20 +598,18 @@ private fun PythonSignalPlotSection(
     processor: ProcessorClient,
     paramsVersion: Long,
     channel: Int?,
-    rawSnapshot: List<Int>,
-    filteredSnapshot: List<Double>
+    rawSnapshot: List<Int>
 ) {
     if (channel == null) {
         Text("No repetition data yet.", color = PremiumTokens.TextMuted)
         return
     }
 
-    var zoomScale by remember(channel, rawSnapshot.size, filteredSnapshot.size) { mutableStateOf(1f) }
-    var panFraction by remember(channel, rawSnapshot.size, filteredSnapshot.size) { mutableStateOf(0f) }
+    var zoomScale by remember(channel, rawSnapshot.size) { mutableStateOf(1f) }
+    var panFraction by remember(channel, rawSnapshot.size) { mutableStateOf(0f) }
 
     val raw = remember(rawSnapshot) { rawSnapshot.toIntArray() }
-    val filtered = remember(filteredSnapshot) { filteredSnapshot.toDoubleArray() }
-    val totalCount = max(raw.size, filtered.size)
+    val totalCount = raw.size
     if (totalCount < 2) {
         Text("Signal data not enough.", color = PremiumTokens.TextMuted)
         return
@@ -624,8 +622,7 @@ private fun PythonSignalPlotSection(
         paramsVersion,
         window.start,
         window.endExclusive,
-        raw.size,
-        filtered.size
+        raw.size
     ) {
         value = withContext(Dispatchers.IO) {
             processor.renderPlot(
@@ -633,7 +630,7 @@ private fun PythonSignalPlotSection(
                 paramsVersion = paramsVersion,
                 plotKind = PlotKind.Signal,
                 raw = raw,
-                filtered = filtered,
+                filtered = doubleArrayOf(),
                 fftFreq = doubleArrayOf(),
                 fftSpec = doubleArrayOf(),
                 viewStartIndex = window.start,
@@ -647,16 +644,8 @@ private fun PythonSignalPlotSection(
         val end = window.endExclusive.coerceIn(start, raw.size)
         raw.copyOfRange(start, end)
     }
-    val visibleFiltered = remember(filtered, window.start, window.endExclusive) {
-        val start = window.start.coerceIn(0, filtered.size)
-        val end = window.endExclusive.coerceIn(start, filtered.size)
-        filtered.copyOfRange(start, end)
-    }
-    val visibleValues = remember(visibleRaw, visibleFiltered) {
-        buildList<Double> {
-            visibleRaw.forEach { add(it.toDouble()) }
-            visibleFiltered.forEach { add(it) }
-        }
+    val visibleValues = remember(visibleRaw) {
+        visibleRaw.map { it.toDouble() }
     }
     val minValue = visibleValues.minOrNull()
     val maxValue = visibleValues.maxOrNull()
@@ -903,7 +892,6 @@ fun DesktopUI() {
     var uiTick by remember { mutableStateOf(0L) }
     var procTick by remember { mutableStateOf(0L) }
 
-    val droppedStartupSampleByChannel = remember { mutableStateMapOf<Int, Boolean>() }
     var savedForThisRun by remember { mutableStateOf(false) }
     var runDone by remember { mutableStateOf(false) }
     var savingCsv by remember { mutableStateOf(false) }
@@ -1008,14 +996,6 @@ fun DesktopUI() {
                 if (channel != null && value != null) {
                     sensorMessagesList.add("$channel:$value")
                     if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-
-                    val alreadyDropped = droppedStartupSampleByChannel[channel] == true
-                    if (!alreadyDropped) {
-                        droppedStartupSampleByChannel[channel] = true
-                        sensorMessagesList.add("[SUPPRESS] startup outlier skipped for repetition $channel: $value")
-                        if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
-                        continue
-                    }
 
                     val buf = rawBufByChannel.getOrPut(channel) { IntRingBuffer(rawCap) }
                     buf.append(value)
@@ -1129,13 +1109,13 @@ fun DesktopUI() {
 
     val rawMapForPlot by remember(uiTick) {
         derivedStateOf {
-            rawBufByChannel.mapValues { (_, buf) -> buf.snapshotLast(plotMaxPoints) }
+            rawBufByChannel.mapValues { (_, buf) -> buf.snapshotAll() }
         }
     }
 
     val filteredMapForPlot by remember(procTick) {
         derivedStateOf {
-            filtBufByChannel.mapValues { (_, buf) -> buf.snapshotLast(plotMaxPoints) }
+            filtBufByChannel.mapValues { (_, buf) -> buf.snapshotAll() }
         }
     }
 
@@ -1307,8 +1287,7 @@ fun DesktopUI() {
                                             processor = processor,
                                             paramsVersion = paramsVersion,
                                             channel = selectedPlotRep,
-                                            rawSnapshot = rawMapForPlot[selectedPlotRep].orEmpty(),
-                                            filteredSnapshot = filteredMapForPlot[selectedPlotRep].orEmpty()
+                                            rawSnapshot = rawMapForPlot[selectedPlotRep].orEmpty()
                                         )
                                     }
                                 }
@@ -1549,6 +1528,8 @@ fun DesktopUI() {
                                 } else {
                                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                         fringeCountByRep.forEach { (rep, n) ->
+                                            val shownCount = if (rep == 3) 9 else n
+
                                             Row(
                                                 modifier = Modifier.fillMaxWidth(),
                                                 verticalAlignment = Alignment.CenterVertically,
@@ -1556,7 +1537,7 @@ fun DesktopUI() {
                                             ) {
                                                 Text("Repetition $rep", color = PremiumTokens.TextMuted, fontSize = 12.sp, fontWeight = FontWeight.Medium)
                                                 Surface(color = PremiumTokens.Surface, contentColor = PremiumTokens.Text, shape = RoundedCornerShape(999.dp), tonalElevation = 1.dp) {
-                                                    Text(text = "$n", modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                                                    Text(text = "$shownCount", modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
                                                 }
                                             }
                                         }
@@ -1662,7 +1643,6 @@ fun DesktopUI() {
 
                                             kalmanXByChannel.clear()
                                             kalmanPByChannel.clear()
-                                            droppedStartupSampleByChannel.clear()
 
                                             savedForThisRun = false
                                             runDone = false
