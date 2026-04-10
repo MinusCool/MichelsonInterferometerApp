@@ -1,4 +1,6 @@
 import sys
+import collections
+import gc
 import json
 import traceback
 import base64
@@ -48,10 +50,9 @@ def kalman_process(ch: int, chunk: np.ndarray, q: float, r: float, version: int)
 
     out = np.empty(chunk.shape[0], dtype=np.float64)
     for i, z in enumerate(chunk.astype(np.float64, copy=False)):
-        x_pred = x
         P_pred = P + q
         K = P_pred / (P_pred + r)
-        x = x_pred + K * (z - x_pred)
+        x = x + K * (z - x)
         P = (1.0 - K) * P_pred
         out[i] = x
 
@@ -219,14 +220,16 @@ def update_global_peak_count(
     prominence_window: int = 12,
 ) -> int:
     state = _filtered_history.get(ch)
+
     if state is None or int(state.get("version", -1)) != version:
-        state = {"version": version, "values": []}
+        state = {"version": version, "values": collections.deque(maxlen=10000)}
         _filtered_history[ch] = state
 
     if y_chunk.size:
-        state["values"].extend(np.asarray(y_chunk, dtype=np.float64).tolist())
+        state["values"].extend(y_chunk.tolist())
 
     values = np.asarray(state["values"], dtype=np.float64)
+
     return count_fringes_from_peaks(
         values,
         min_peak_distance=min_peak_distance,
@@ -624,6 +627,11 @@ def handle_render_plot(req: dict) -> dict:
         image_base64 = render_fft_plot(freq, spec, start, end_exclusive, ch)
     else:
         raise RuntimeError(f"Unknown plot kind: {plot_kind}")
+
+    # --- OPTIMALISASI PENCEGAH MEMORY LEAK ---
+    plt.close('all')
+    gc.collect()
+    # -----------------------------------------
 
     return {
         "ok": True,

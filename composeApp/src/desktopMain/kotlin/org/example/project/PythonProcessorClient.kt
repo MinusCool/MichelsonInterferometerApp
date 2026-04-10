@@ -311,7 +311,7 @@ class PythonProcessorClient(
         )
     }
 
-    private fun sendAndRead(line: String): String {
+    private fun sendAndRead(line: String): String = synchronized(this) {
         val w = writer ?: error("worker writer null")
         val r = reader ?: error("worker reader null")
 
@@ -319,6 +319,6 @@ class PythonProcessorClient(
         w.newLine()
         w.flush()
 
-        return r.readLine() ?: error("Worker terminated unexpectedly")
+        return r.readLine() ?: error("worker closed output")
     }
 }
