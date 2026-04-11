@@ -61,8 +61,13 @@ data class PyRenderPlotRequest(
     val plotKind: String,
     val raw: IntArray = intArrayOf(),
     val filtered: DoubleArray = doubleArrayOf(),
+    // Tambahan untuk Binary File Hand-off
+    val rawFile: String? = null,
+    val filteredFile: String? = null,
     val fftFreq: DoubleArray = doubleArrayOf(),
     val fftSpec: DoubleArray = doubleArrayOf(),
+    val fftFreqFile: String? = null,
+    val fftSpecFile: String? = null,
     val viewStartIndex: Int? = null,
     val viewEndExclusive: Int? = null
 )
@@ -284,31 +289,70 @@ class PythonProcessorClient(
     ): PlotRenderResult {
         ensureStarted()
 
-        val req = PyRenderPlotRequest(
-            channel = channel,
-            paramsVersion = paramsVersion,
-            plotKind = plotKind.wireValue,
-            raw = raw,
-            filtered = filtered,
-            fftFreq = fftFreq,
-            fftSpec = fftSpec,
-            viewStartIndex = viewStartIndex,
-            viewEndExclusive = viewEndExclusive
-        )
+        val tempRaw = File.createTempFile("raw_plot_", ".bin")
+        val tempFilt = File.createTempFile("filt_plot_", ".bin")
+        val tempFftFreq = File.createTempFile("fft_freq_", ".bin")
+        val tempFftSpec = File.createTempFile("fft_spec_", ".bin")
 
-        val respLine = sendAndRead(json.encodeToString(PyRenderPlotRequest.serializer(), req))
-        val resp = json.decodeFromString(PyRenderPlotResponse.serializer(), respLine)
+        try {
+            // Tulis Raw & Filtered
+            java.io.DataOutputStream(java.io.BufferedOutputStream(java.io.FileOutputStream(tempRaw))).use { out ->
+                for (v in raw) out.writeInt(v)
+            }
+            java.io.DataOutputStream(java.io.BufferedOutputStream(java.io.FileOutputStream(tempFilt))).use { out ->
+                for (v in filtered) out.writeDouble(v)
+            }
+            // Tulis FFT Freq & Spec
+            java.io.DataOutputStream(java.io.BufferedOutputStream(java.io.FileOutputStream(tempFftFreq))).use { out ->
+                for (v in fftFreq) out.writeDouble(v)
+            }
+            java.io.DataOutputStream(java.io.BufferedOutputStream(java.io.FileOutputStream(tempFftSpec))).use { out ->
+                for (v in fftSpec) out.writeDouble(v)
+            }
 
-        if (!resp.ok) {
-            error("Worker render error: ${resp.error}\n${resp.trace}")
+            val req = PyRenderPlotRequest(
+                channel = channel,
+                paramsVersion = paramsVersion,
+                plotKind = plotKind.wireValue,
+
+                // KOSONGKAN SEMUA ARRAY JSON
+                raw = intArrayOf(),
+                filtered = doubleArrayOf(),
+                fftFreq = doubleArrayOf(),
+                fftSpec = doubleArrayOf(),
+
+                // KIRIM PATH FILENYA SAJA
+                rawFile = tempRaw.absolutePath,
+                filteredFile = tempFilt.absolutePath,
+                fftFreqFile = tempFftFreq.absolutePath,
+                fftSpecFile = tempFftSpec.absolutePath,
+
+                viewStartIndex = viewStartIndex,
+                viewEndExclusive = viewEndExclusive
+            )
+
+            val respLine = sendAndRead(json.encodeToString(PyRenderPlotRequest.serializer(), req))
+            val resp = json.decodeFromString(PyRenderPlotResponse.serializer(), respLine)
+
+            if (!resp.ok) {
+                error("Worker render error: ${resp.error}\n${resp.trace}")
+            }
+
+            return PlotRenderResult(
+                channel = channel,
+                paramsVersion = resp.paramsVersion ?: paramsVersion,
+                plotKind = plotKind,
+                imageBase64 = resp.imageBase64 ?: ""
+            )
+
+        } finally {
+            Thread.sleep(500)
+            // Bersihkan memori disk
+            tempRaw.delete()
+            tempFilt.delete()
+            tempFftFreq.delete()
+            tempFftSpec.delete()
         }
-
-        return PlotRenderResult(
-            channel = channel,
-            paramsVersion = resp.paramsVersion ?: paramsVersion,
-            plotKind = plotKind,
-            imageBase64 = resp.imageBase64 ?: ""
-        )
     }
 
     private fun sendAndRead(line: String): String = synchronized(this) {

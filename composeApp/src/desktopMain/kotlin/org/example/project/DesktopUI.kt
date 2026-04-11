@@ -41,7 +41,9 @@ import java.util.concurrent.atomic.AtomicLong
 import org.jetbrains.skia.Image as SkiaImage
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.cancellation.CancellationException
 
 
 private fun detectFilteredPeakIndicesGlobal(
@@ -669,46 +671,70 @@ private fun PythonSignalPlotSection(
     }
 
     val window = computePlotWindow(totalCount, zoomScale, panFraction, minVisible = 64)
-    val imageBase64 by produceState(
-        initialValue = "",
-        channel,
-        paramsVersion,
-        window.start,
-        window.endExclusive,
-        raw.size,
-        filtered.size
-    ) {
-        value = withContext(Dispatchers.IO) {
-            processor.renderPlot(
-                channel = channel,
-                paramsVersion = paramsVersion,
-                plotKind = PlotKind.Signal,
-                raw = raw,
-                filtered = filtered,
-                fftFreq = doubleArrayOf(),
-                fftSpec = doubleArrayOf(),
-                viewStartIndex = window.start,
-                viewEndExclusive = window.endExclusive
-            ).imageBase64
-        }
-    }
-    val bitmap = remember(imageBase64) { decodePlotImageOrNull(imageBase64) }
+
     val visibleRaw = remember(raw, window.start, window.endExclusive) {
         val start = window.start.coerceIn(0, raw.size)
         val end = window.endExclusive.coerceIn(start, raw.size)
         raw.copyOfRange(start, end)
     }
+
     val visibleFiltered = remember(filtered, window.start, window.endExclusive) {
         val start = window.start.coerceIn(0, filtered.size)
         val end = window.endExclusive.coerceIn(start, filtered.size)
         filtered.copyOfRange(start, end)
     }
+
+    val dataVersion = remember(raw, filtered) {
+        raw.size * 31 + filtered.size
+    }
+
+    var imageBase64 by remember { mutableStateOf("") }
+    var renderJob by remember { mutableStateOf<Job?>(null) }
+
+    LaunchedEffect(
+        channel,
+        paramsVersion,
+        dataVersion,
+        window.start,
+        window.endExclusive
+    ) {
+        renderJob?.cancel()
+
+        renderJob = launch(Dispatchers.Default.limitedParallelism(2)) {
+            try {
+                delay(80)
+
+                val result = processor.renderPlot(
+                    channel = channel,
+                    paramsVersion = paramsVersion,
+                    plotKind = PlotKind.Signal,
+                    raw = visibleRaw,
+                    filtered = visibleFiltered,
+                    fftFreq = doubleArrayOf(),
+                    fftSpec = doubleArrayOf(),
+                    viewStartIndex = 0,
+                    viewEndExclusive = visibleRaw.size
+                )
+
+                withContext(Dispatchers.Main) {
+                    imageBase64 = result.imageBase64
+                }
+            } catch (_: CancellationException) {
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    val bitmap = remember(imageBase64) { decodePlotImageOrNull(imageBase64) }
+
     val visibleValues = remember(visibleRaw, visibleFiltered) {
         buildList<Double> {
             visibleRaw.forEach { add(it.toDouble()) }
             visibleFiltered.forEach { add(it) }
         }
     }
+
     val minValue = visibleValues.minOrNull()
     val maxValue = visibleValues.maxOrNull()
 
@@ -776,32 +802,61 @@ private fun PythonFftPlotSection(
     }
 
     val window = computePlotWindow(totalCount, zoomScale, panFraction, minVisible = 32)
-    val imageBase64 by produceState(
-        initialValue = "",
+
+    val visibleFreq = remember(fftFreq, window.start, window.endExclusive) {
+        fftFreq.copyOfRange(window.start, window.endExclusive)
+    }
+
+    val visibleSpec = remember(fftSpec, window.start, window.endExclusive) {
+        fftSpec.copyOfRange(window.start, window.endExclusive)
+    }
+
+    val dataVersion = remember(fftFreq, fftSpec) {
+        fftFreq.size * 31 + fftSpec.size
+    }
+
+    var fftImageBase64 by remember { mutableStateOf("") }
+    var fftRenderJob by remember { mutableStateOf<Job?>(null) }
+
+    LaunchedEffect(
         channel,
         paramsVersion,
+        dataVersion,
         window.start,
-        window.endExclusive,
-        fftFreq.size,
-        fftSpec.size
+        window.endExclusive
     ) {
-        value = withContext(Dispatchers.IO) {
-            processor.renderPlot(
-                channel = channel,
-                paramsVersion = paramsVersion,
-                plotKind = PlotKind.Fft,
-                raw = intArrayOf(),
-                filtered = doubleArrayOf(),
-                fftFreq = fftFreq,
-                fftSpec = fftSpec,
-                viewStartIndex = window.start,
-                viewEndExclusive = window.endExclusive
-            ).imageBase64
+        fftRenderJob?.cancel()
+
+        fftRenderJob = launch(Dispatchers.Default.limitedParallelism(2)) {
+            try {
+                delay(80)
+
+                val result = processor.renderPlot(
+                    channel = channel,
+                    paramsVersion = paramsVersion,
+                    plotKind = PlotKind.Fft,
+                    raw = intArrayOf(),
+                    filtered = doubleArrayOf(),
+                    fftFreq = visibleFreq,
+                    fftSpec = visibleSpec,
+                    viewStartIndex = 0,
+                    viewEndExclusive = visibleFreq.size
+                )
+
+                withContext(Dispatchers.Main) {
+                    fftImageBase64 = result.imageBase64
+                }
+            } catch (_: CancellationException) {
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
     }
-    val bitmap = remember(imageBase64) { decodePlotImageOrNull(imageBase64) }
-    val freqStart = fftFreq.getOrNull(window.start) ?: 0.0
-    val freqEnd = fftFreq.getOrNull((window.endExclusive - 1).coerceAtLeast(window.start)) ?: freqStart
+
+    val bitmap = remember(fftImageBase64) { decodePlotImageOrNull(fftImageBase64) }
+
+    val freqStart = visibleFreq.firstOrNull() ?: 0.0
+    val freqEnd = visibleFreq.lastOrNull() ?: freqStart
 
     Column(modifier = Modifier.fillMaxSize()) {
         PlotViewportControls(

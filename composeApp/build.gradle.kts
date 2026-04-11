@@ -113,9 +113,9 @@ compose.desktop {
         }
 
         // 👇 Override path JAR agar tidak mencari hasil ProGuard
-        fromFiles(
-            file("build/compose/jars/main/composeApp-desktop.jar")
-        )
+//        fromFiles(
+//            file("build/compose/jars/main/composeApp-desktop.jar")
+//        )
 
         nativeDistributions {
             targetFormats(TargetFormat.Exe)
@@ -126,6 +126,8 @@ compose.desktop {
 
             windows {
                 iconFile.set(project.file("src/desktopMain/resources/icon.png"))
+                menu = true
+                shortcut = true
             }
         }
     }

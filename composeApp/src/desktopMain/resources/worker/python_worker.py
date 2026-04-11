@@ -4,6 +4,7 @@ import gc
 import json
 import traceback
 import base64
+import os
 from io import BytesIO
 import numpy as np
 import matplotlib
@@ -124,11 +125,11 @@ def _local_prominence(values: np.ndarray, idx: int, half_window: int) -> float:
 
 
 def _detect_peaks_fallback(
-    values: np.ndarray,
-    min_peak_distance: int,
-    peak_threshold: float,
-    prominence_threshold: float,
-    prominence_window: int,
+        values: np.ndarray,
+        min_peak_distance: int,
+        peak_threshold: float,
+        prominence_threshold: float,
+        prominence_window: int,
 ) -> np.ndarray:
     peaks = []
     last_peak = -10_000
@@ -155,11 +156,11 @@ def _detect_peaks_fallback(
 
 
 def detect_peaks_on_filtered(
-    values: np.ndarray,
-    min_peak_distance: int = 3,
-    rel_height: float = 0.15,
-    rel_prominence: float = 0.08,
-    prominence_window: int = 12,
+        values: np.ndarray,
+        min_peak_distance: int = 3,
+        rel_height: float = 0.15,
+        rel_prominence: float = 0.08,
+        prominence_window: int = 12,
 ) -> np.ndarray:
     if values.size < 3:
         return np.array([], dtype=np.int64)
@@ -194,11 +195,11 @@ def detect_peaks_on_filtered(
 
 
 def count_fringes_from_peaks(
-    values: np.ndarray,
-    min_peak_distance: int = 3,
-    rel_height: float = 0.15,
-    rel_prominence: float = 0.08,
-    prominence_window: int = 12,
+        values: np.ndarray,
+        min_peak_distance: int = 3,
+        rel_height: float = 0.15,
+        rel_prominence: float = 0.08,
+        prominence_window: int = 12,
 ) -> int:
     peaks = detect_peaks_on_filtered(
         values,
@@ -211,13 +212,13 @@ def count_fringes_from_peaks(
 
 
 def update_global_peak_count(
-    ch: int,
-    version: int,
-    y_chunk: np.ndarray,
-    min_peak_distance: int = 3,
-    rel_height: float = 0.15,
-    rel_prominence: float = 0.08,
-    prominence_window: int = 12,
+        ch: int,
+        version: int,
+        y_chunk: np.ndarray,
+        min_peak_distance: int = 3,
+        rel_height: float = 0.15,
+        rel_prominence: float = 0.08,
+        prominence_window: int = 12,
 ) -> int:
     state = _filtered_history.get(ch)
 
@@ -286,13 +287,13 @@ def butter_filter(x: np.ndarray, fs: float, cutoff, order: int = 4, btype: str =
 
 
 def preprocess_signal_for_fft(
-    y: np.ndarray,
-    fs: float,
-    use_highpass: bool = True,
-    hp_cutoff: float = 5.0,
-    hp_order: int = 4,
-    use_median_baseline: bool = True,
-    median_kernel_ratio: float = 0.03,
+        y: np.ndarray,
+        fs: float,
+        use_highpass: bool = True,
+        hp_cutoff: float = 5.0,
+        hp_order: int = 4,
+        use_median_baseline: bool = True,
+        median_kernel_ratio: float = 0.03,
 ) -> np.ndarray:
     if y.size == 0:
         return y.astype(np.float64)
@@ -355,13 +356,13 @@ def compute_fft_spectrum(y: np.ndarray, fs: float, fmin: float, fmax: float, zer
 
 
 def estimate_auto_band(
-    freq: np.ndarray,
-    spec: np.ndarray,
-    search_band=(5.0, 120.0),
-    min_width=8.0,
-    max_width=24.0,
-    rel_height=0.35,
-    margin_hz=2.0,
+        freq: np.ndarray,
+        spec: np.ndarray,
+        search_band=(5.0, 120.0),
+        min_width=8.0,
+        max_width=24.0,
+        rel_height=0.35,
+        margin_hz=2.0,
 ):
     if freq is None or spec is None or len(freq) == 0 or len(spec) == 0:
         return None, None
@@ -415,12 +416,12 @@ def estimate_auto_band(
 
 
 def compute_fft_summary(
-    signal: np.ndarray,
-    record_duration_sec: float,
-    fft_fmin: float,
-    fft_fmax: float,
-    zero_pad_factor: int = 8,
-    use_auto_band: bool = True,
+        signal: np.ndarray,
+        record_duration_sec: float,
+        fft_fmin: float,
+        fft_fmax: float,
+        zero_pad_factor: int = 8,
+        use_auto_band: bool = True,
 ):
     if signal.size < 16:
         return {
@@ -610,6 +611,9 @@ def render_fft_plot(freq: np.ndarray, spec: np.ndarray, start, end_exclusive, ch
     return _fig_to_base64(fig)
 
 
+# =========================================================
+# MODIFIED: HANDLE RENDER PLOT (Binary Handoff Support)
+# =========================================================
 def handle_render_plot(req: dict) -> dict:
     ch = int(req["channel"])
     params_version = int(req.get("paramsVersion", 0))
@@ -618,20 +622,45 @@ def handle_render_plot(req: dict) -> dict:
     end_exclusive = req.get("viewEndExclusive")
 
     if plot_kind == "signal":
-        raw = np.array(req.get("raw", []), dtype=np.float64)
-        filtered = np.array(req.get("filtered", []), dtype=np.float64)
+        # 1. BACA DATA RAW (Prioritaskan File Biner, pakai >i4 untuk Big-Endian 32-bit Int)
+        raw_file = req.get("rawFile")
+        if raw_file and os.path.exists(raw_file):
+            raw = np.fromfile(raw_file, dtype=">i4").astype(np.float64)
+        else:
+            raw = np.array(req.get("raw", []), dtype=np.float64)
+
+        # 2. BACA DATA FILTERED (Prioritaskan File Biner, pakai >f8 untuk Big-Endian 64-bit Float)
+        filt_file = req.get("filteredFile")
+        if filt_file and os.path.exists(filt_file):
+            filtered = np.fromfile(filt_file, dtype=">f8").astype(np.float64)
+        else:
+            filtered = np.array(req.get("filtered", []), dtype=np.float64)
+
         image_base64 = render_signal_plot(raw, filtered, start, end_exclusive, ch)
+
     elif plot_kind == "fft":
-        freq = np.array(req.get("fftFreq", []), dtype=np.float64)
-        spec = np.array(req.get("fftSpec", []), dtype=np.float64)
+        # BACA FFT FREQ (Biner >f8)
+        freq_file = req.get("fftFreqFile")
+        if freq_file and os.path.exists(freq_file):
+            freq = np.fromfile(freq_file, dtype=">f8").astype(np.float64)
+        else:
+            freq = np.array(req.get("fftFreq", []), dtype=np.float64)
+
+        # BACA FFT SPEC (Biner >f8)
+        spec_file = req.get("fftSpecFile")
+        if spec_file and os.path.exists(spec_file):
+            spec = np.fromfile(spec_file, dtype=">f8").astype(np.float64)
+        else:
+            spec = np.array(req.get("fftSpec", []), dtype=np.float64)
+
         image_base64 = render_fft_plot(freq, spec, start, end_exclusive, ch)
     else:
         raise RuntimeError(f"Unknown plot kind: {plot_kind}")
 
-    # --- OPTIMALISASI PENCEGAH MEMORY LEAK ---
+    # --- OPTIMALISASI PENCEGAH MEMORY LEAK MATPLOTLIB ---
     plt.close('all')
     gc.collect()
-    # -----------------------------------------
+    # ----------------------------------------------------
 
     return {
         "ok": True,
