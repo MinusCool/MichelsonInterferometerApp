@@ -700,9 +700,9 @@ private fun PythonSignalPlotSection(
     ) {
         renderJob?.cancel()
 
-        renderJob = launch(Dispatchers.Default.limitedParallelism(2)) {
+        renderJob = launch(Dispatchers.Default.limitedParallelism(4)) {
             try {
-                delay(80)
+//                delay(80)
 
                 val result = processor.renderPlot(
                     channel = channel,
@@ -827,9 +827,9 @@ private fun PythonFftPlotSection(
     ) {
         fftRenderJob?.cancel()
 
-        fftRenderJob = launch(Dispatchers.Default.limitedParallelism(2)) {
+        fftRenderJob = launch(Dispatchers.Default.limitedParallelism(4)) {
             try {
-                delay(80)
+//                delay(80)
 
                 val result = processor.renderPlot(
                     channel = channel,
