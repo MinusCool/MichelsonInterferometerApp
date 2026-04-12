@@ -179,11 +179,32 @@ fun decodeInt16LeToIntArray(
     return out
 }
 
+fun decodeInt16LeToShortArray(
+    src: ByteArray,
+    offset: Int,
+    sampleCount: Int
+): ShortArray {
+    if (sampleCount <= 0) return ShortArray(0)
+    val requiredBytes = sampleCount * 2
+    require(offset >= 0) { "offset must be >= 0" }
+    require(offset + requiredBytes <= src.size) { "decodeInt16LeToShortArray out of bounds" }
+
+    val out = ShortArray(sampleCount)
+    var p = offset
+    for (i in 0 until sampleCount) {
+        val lo = src[p].toInt() and 0xFF
+        val hi = src[p + 1].toInt()
+        out[i] = ((hi shl 8) or lo).toShort()
+        p += 2
+    }
+    return out
+}
+
 fun decodeInt16LeInto(
     src: ByteArray,
     offset: Int,
     sampleCount: Int,
-    sink: IntRingBuffer
+    sink: ShortRingBuffer
 ) {
     sink.appendDecodedInt16LeFromByteArray(
         src = src,
@@ -196,7 +217,7 @@ fun decodeInt16LeIntoCount(
     src: ByteArray,
     offset: Int,
     sampleCount: Int,
-    sink: IntRingBuffer
+    sink: ShortRingBuffer
 ): Int {
     return sink.appendDecodedInt16LeFromByteArray(
         src = src,

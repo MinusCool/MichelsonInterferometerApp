@@ -346,12 +346,10 @@ class PythonProcessorClient(
             )
 
         } finally {
-            Thread.sleep(500)
-            // Bersihkan memori disk
-            tempRaw.delete()
-            tempFilt.delete()
-            tempFftFreq.delete()
-            tempFftSpec.delete()
+            runCatching { tempRaw.delete() }
+            runCatching { tempFilt.delete() }
+            runCatching { tempFftFreq.delete() }
+            runCatching { tempFftSpec.delete() }
         }
     }
 

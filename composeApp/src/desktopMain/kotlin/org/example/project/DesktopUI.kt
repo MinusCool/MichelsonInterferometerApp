@@ -44,6 +44,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.cancellation.CancellationException
+import kotlinx.coroutines.asCoroutineDispatcher
+import java.util.concurrent.Executors
 
 
 private fun detectFilteredPeakIndicesGlobal(
@@ -282,7 +284,7 @@ private fun VariantChipGroup(selected: Int, onSelect: (Int) -> Unit) {
 private data class UiDecodedPacket(
     val repId: Int,
     val variant: Variant,
-    val samples: IntArray?,
+    val samples: ShortArray?,
     val seq: Long,
     val tSendUs: Long,
     val sampleCount: Int,
@@ -359,7 +361,7 @@ private fun decodePacketForUi(
             UiDecodedPacket(
                 repId = p.repId,
                 variant = variant,
-                samples = p.samples,
+                samples = ShortArray(p.samples.size) { i -> p.samples[i].toShort() },
                 seq = p.seq,
                 tSendUs = p.tSendUs,
                 sampleCount = p.sampleCount,
@@ -376,20 +378,11 @@ private fun decodePacketForUi(
         Variant.BIN -> {
             val h = parseBinaryPacketHeader(payload)
             val accepted = h.lenOk && h.crcOk
-            val samples = if (accepted) {
-                decodeInt16LeToIntArray(
-                    src = payload,
-                    offset = h.payloadOffset,
-                    sampleCount = h.sampleCount * h.channelCount
-                )
-            } else {
-                IntArray(0)
-            }
 
             UiDecodedPacket(
                 repId = h.repId,
                 variant = variant,
-                samples = samples,
+                samples = null,
                 seq = h.seq,
                 tSendUs = h.tSendUs,
                 sampleCount = h.sampleCount,
@@ -554,6 +547,19 @@ private fun decodePlotImageOrNull(imageBase64: String): androidx.compose.ui.grap
 private data class UiDialogInfo(
     val title: String,
     val message: String
+)
+
+private data class DecodeLoopResult(
+    val logMessage: String? = null,
+    val wroteSamples: Boolean = false,
+    val refreshUiAfterRun: Boolean = false
+)
+
+private data class ProcessingTask(
+    val channel: Int,
+    val seqStart: Long,
+    val rawTail: IntArray,
+    val rawChunk: IntArray
 )
 
 @Composable
@@ -935,14 +941,38 @@ private fun SidebarSectionCard(
     }
 }
 
+private fun materializeBodyOutsideLock(
+    decoded: UiDecodedPacket,
+    payload: ByteArray
+): ShortArray? {
+    return when (decoded.variant) {
+        Variant.TEXT -> decoded.samples ?: ShortArray(0)
+
+        Variant.BIN -> {
+            val payloadOffset = decoded.payloadOffset ?: return ShortArray(0)
+            val totalSamples = decoded.sampleCount * decoded.channelCount
+            decodeInt16LeToShortArray(
+                src = payload,
+                offset = payloadOffset,
+                sampleCount = totalSamples
+            )
+        }
+
+        Variant.BIN_ZC,
+        Variant.UNKNOWN -> null
+    }
+}
+
 private fun writeDecodedPacketToBuffer(
     decoded: UiDecodedPacket,
     payload: ByteArray,
-    buf: IntRingBuffer
+    buf: ShortRingBuffer,
+    predecodedSamples: ShortArray? = null
 ): Int {
     return when (decoded.variant) {
-        Variant.TEXT, Variant.BIN -> {
-            val samples = decoded.samples ?: IntArray(0)
+        Variant.TEXT,
+        Variant.BIN -> {
+            val samples = predecodedSamples ?: ShortArray(0)
             if (samples.isEmpty()) 0 else {
                 buf.appendAll(samples)
                 samples.size
@@ -984,6 +1014,13 @@ fun DesktopUI() {
 
     val scope = rememberCoroutineScope()
 
+    val decodeDispatcher = remember {
+        Executors.newSingleThreadExecutor { r ->
+            Thread(r, "decode-thread").apply { isDaemon = true }
+        }.asCoroutineDispatcher()
+    }
+    val dataLock = remember { Any() }
+
     var selectedFilter by remember { mutableStateOf("SG") }
     var sgWindow by remember { mutableStateOf(7) }
     var sgOrder by remember { mutableStateOf(2) }
@@ -1009,7 +1046,7 @@ fun DesktopUI() {
     var selectedVariantCode by remember { mutableStateOf(1) }
     var activeRunId by remember { mutableStateOf<Long?>(null) }
     var runInProgress by remember { mutableStateOf(false) }
-    val lastSeqByRep = remember { mutableStateMapOf<Int, Long>() }
+    val lastSeqByRep = remember { mutableMapOf<Int, Long>() }
 
     val rawCap = 200_000
     val filtCap = 200_000
@@ -1025,18 +1062,20 @@ fun DesktopUI() {
     val fftUseAutoBand = true
     val isolateDecodeBenchmarkDuringRun = true
 
-    val rawBufByChannel = remember { mutableStateMapOf<Int, IntRingBuffer>() }
-    val filtBufByChannel = remember { mutableStateMapOf<Int, DoubleRingBuffer>() }
-    val nextSeqToProcess = remember { mutableStateMapOf<Int, Long>() }
+    val rawBufByChannel = remember { mutableMapOf<Int, ShortRingBuffer>() }
+    val filtBufByChannel = remember { mutableMapOf<Int, DoubleRingBuffer>() }
+    val nextSeqToProcess = remember { mutableMapOf<Int, Long>() }
 
-    val peakCountByRep = remember { mutableStateMapOf<Int, Int>() }
-    val fftDominantFreqByRep = remember { mutableStateMapOf<Int, Double?>() }
-    val fftDominantAmpByRep = remember { mutableStateMapOf<Int, Double?>() }
-    val fftFreqByRep = remember { mutableStateMapOf<Int, DoubleArray>() }
-    val fftSpecByRep = remember { mutableStateMapOf<Int, DoubleArray>() }
+    val peakCountByRep = remember { mutableMapOf<Int, Int>() }
+    val fftDominantFreqByRep = remember { mutableMapOf<Int, Double?>() }
+    val fftDominantAmpByRep = remember { mutableMapOf<Int, Double?>() }
+    val fftFreqByRep = remember { mutableMapOf<Int, DoubleArray>() }
+    val fftSpecByRep = remember { mutableMapOf<Int, DoubleArray>() }
 
-    val kalmanXByChannel = remember { mutableStateMapOf<Int, Double>() }
-    val kalmanPByChannel = remember { mutableStateMapOf<Int, Double>() }
+    val kalmanXByChannel = remember { mutableMapOf<Int, Double>() }
+    val kalmanPByChannel = remember { mutableMapOf<Int, Double>() }
+
+    val telemetryRows = remember { mutableListOf<PacketTelemetryRecord>() }
 
     val usePython = true
     val pythonClient = remember { PythonProcessorClient(resourcePath = "worker/python_worker.py") }
@@ -1054,23 +1093,31 @@ fun DesktopUI() {
     var donePending by remember { mutableStateOf(false) }
     var doneSeenAtMs by remember { mutableStateOf<Long?>(null) }
     var lastDataAtMs by remember { mutableStateOf<Long?>(null) }
-    val telemetryRows = remember { mutableStateListOf<PacketTelemetryRecord>() }
 
     var autoRunsPerVariant by remember { mutableStateOf("10") }
     var autoOrderMode by remember { mutableStateOf("interleaved") } // interleaved / grouped
-    var autoDelayMsText by remember { mutableStateOf("300") }
+    var autoDelayMsText by remember { mutableStateOf("1000") }
     var autoRunnerRunning by remember { mutableStateOf(false) }
     var autoStopRequested by remember { mutableStateOf(false) }
 
     DisposableEffect(Unit) {
         onDispose {
             runCatching { pythonClient.stop() }
+            runCatching { decodeDispatcher.close() }
         }
     }
 
     fun appendSensorLog(message: String) {
+        val noisyDuringRun =
+            runInProgress && (
+                    message.startsWith("[PKT") ||
+                            message.startsWith("[GAP")
+                    )
+
+        if (noisyDuringRun) return
+
         sensorMessagesList.add(message)
-        if (sensorMessagesList.size > 200) sensorMessagesList.removeFirst()
+        if (sensorMessagesList.size > 300) sensorMessagesList.removeFirst()
     }
 
     suspend fun synchronizeEspClock(
@@ -1183,19 +1230,21 @@ fun DesktopUI() {
         pythonClient.stop()
         sensorMessagesList.clear()
 
-        rawBufByChannel.clear()
-        filtBufByChannel.clear()
-        nextSeqToProcess.clear()
+        synchronized(dataLock) {
+            rawBufByChannel.clear()
+            filtBufByChannel.clear()
+            nextSeqToProcess.clear()
 
-        peakCountByRep.clear()
-        fftDominantFreqByRep.clear()
-        fftDominantAmpByRep.clear()
-        fftFreqByRep.clear()
-        fftSpecByRep.clear()
-        telemetryRows.clear()
+            peakCountByRep.clear()
+            fftDominantFreqByRep.clear()
+            fftDominantAmpByRep.clear()
+            fftFreqByRep.clear()
+            fftSpecByRep.clear()
+            telemetryRows.clear()
 
-        kalmanXByChannel.clear()
-        kalmanPByChannel.clear()
+            kalmanXByChannel.clear()
+            kalmanPByChannel.clear()
+        }
 
         savedForThisRun = false
         runDone = false
@@ -1211,7 +1260,7 @@ fun DesktopUI() {
         uiTick++
         procTick++
 
-        showPlot = true
+        showPlot = false
         showFftPlot = false
 
         selectedVariantCode = variantCode
@@ -1239,19 +1288,35 @@ fun DesktopUI() {
 
         savingCsv = true
         return try {
+            val rawSnapshotForCatchup: Map<Int, ShortRingBuffer>
+            val nextSeqSnapshotForCatchup: Map<Int, Long>
+
+            synchronized(dataLock) {
+                rawSnapshotForCatchup = rawBufByChannel.toMap()
+                nextSeqSnapshotForCatchup = nextSeqToProcess.toMap()
+            }
+
             val caughtUp = runCatching {
                 awaitFilterCatchUp(
-                    rawBufByChannel = rawBufByChannel,
-                    nextSeqToProcess = nextSeqToProcess,
+                    rawBufByChannel = rawSnapshotForCatchup,
+                    nextSeqToProcess = nextSeqSnapshotForCatchup,
                     timeoutMs = 3000L,
                     pollMs = 25L
                 )
             }.getOrDefault(false)
 
+            val rawSnapshotForExport: Map<Int, ShortRingBuffer>
+            val filtSnapshotForExport: Map<Int, DoubleRingBuffer>
+
+            synchronized(dataLock) {
+                rawSnapshotForExport = rawBufByChannel.toMap()
+                filtSnapshotForExport = filtBufByChannel.toMap()
+            }
+
             val result = runCatching {
                 exportCsvSnapshotToExperiments(
-                    rawBufByChannel = rawBufByChannel,
-                    filtBufByChannel = filtBufByChannel,
+                    rawBufByChannel = rawSnapshotForExport,
+                    filtBufByChannel = filtSnapshotForExport,
                     rawMax = rawCap,
                     filtMax = filtCap
                 )
@@ -1263,10 +1328,12 @@ fun DesktopUI() {
                     else "CSV saved (catch-up timeout): ${file.absolutePath}"
                 )
 
-                if (telemetryRows.isNotEmpty()) {
-                    val packetFile = exportPacketTelemetryCsv(telemetryRows)
-                    val perRep = buildPerRepTelemetrySummaries(telemetryRows)
-                    val summary = buildRunTelemetrySummary(telemetryRows)
+                val telemetrySnapshot = synchronized(dataLock) { telemetryRows.toList() }
+
+                if (telemetrySnapshot.isNotEmpty()) {
+                    val packetFile = exportPacketTelemetryCsv(telemetrySnapshot)
+                    val perRep = buildPerRepTelemetrySummaries(telemetrySnapshot)
+                    val summary = buildRunTelemetrySummary(telemetrySnapshot)
                     val summaryFile = exportRunTelemetrySummaryCsv(summary, perRep)
 
                     appendSensorLog("Packet telemetry saved: ${packetFile.absolutePath}")
@@ -1316,26 +1383,28 @@ fun DesktopUI() {
             appliedKalmanR = nextR
             paramsVersion++
 
-            for ((_, fbuf) in filtBufByChannel) {
-                fbuf.clear()
-            }
+            synchronized(dataLock) {
+                for ((_, fbuf) in filtBufByChannel) {
+                    fbuf.clear()
+                }
 
-            peakCountByRep.clear()
-            fftDominantFreqByRep.clear()
-            fftDominantAmpByRep.clear()
-            fftFreqByRep.clear()
-            fftSpecByRep.clear()
+                peakCountByRep.clear()
+                fftDominantFreqByRep.clear()
+                fftDominantAmpByRep.clear()
+                fftFreqByRep.clear()
+                fftSpecByRep.clear()
 
-            kalmanXByChannel.clear()
-            kalmanPByChannel.clear()
+                kalmanXByChannel.clear()
+                kalmanPByChannel.clear()
 
-            val lookback = max(analysisLookback.toLong(), (appliedSgWindow * 8).toLong())
-            for ((ch, rbuf) in rawBufByChannel) {
-                val newest = rbuf.newestSeqExclusive()
-                val oldest = rbuf.oldestSeq()
-                val minProcessingStart = (oldest + processingSkipFirstSamples).coerceAtMost(newest)
-                val start = max(minProcessingStart, newest - lookback)
-                nextSeqToProcess[ch] = start
+                val lookback = max(analysisLookback.toLong(), (appliedSgWindow * 8).toLong())
+                for ((ch, rbuf) in rawBufByChannel) {
+                    val newest = rbuf.newestSeqExclusive()
+                    val oldest = rbuf.oldestSeq()
+                    val minProcessingStart = (oldest + processingSkipFirstSamples).coerceAtMost(newest)
+                    val start = max(minProcessingStart, newest - lookback)
+                    nextSeqToProcess[ch] = start
+                }
             }
 
             procTick++
@@ -1379,6 +1448,12 @@ fun DesktopUI() {
                 runDone = true
                 runInProgress = false
                 appendSensorLog("DONE+IDLE1s → ready to save CSV")
+
+                // baru setelah benchmark selesai, UI boleh refresh lagi
+                uiTick++
+                procTick++
+                showPlot = true
+                showFftPlot = false
             }
         }
     }
@@ -1393,7 +1468,7 @@ fun DesktopUI() {
             val tRecvEpochUs = frame.tRecvEpochUs
             val tRecvMonoUs = frame.tRecvMonoUs
 
-            // 1) command / status diproses sebagai text
+            // command/status tetap diproses di main thread
             if (topic == MQTTConfig.topicCommand || topic == MQTTConfig.topicStatus) {
                 val messageText = decodeControlText(payload)
 
@@ -1408,6 +1483,8 @@ fun DesktopUI() {
                     donePending = false
                     runDone = true
                     runInProgress = false
+                    uiTick++
+                    procTick++
                     continue
                 }
 
@@ -1432,7 +1509,6 @@ fun DesktopUI() {
                 continue
             }
 
-            // 2) hanya topic data yang masuk jalur data-plane
             if (topic != MQTTConfig.topicData) {
                 appendSensorLog("[IGNORED:$topic] ${textPreview(payload)}")
                 continue
@@ -1440,118 +1516,192 @@ fun DesktopUI() {
 
             lastDataAtMs = System.currentTimeMillis()
 
-            val tDecodeStartUs = System.nanoTime() / 1000L
+            val decodeResult = withContext(decodeDispatcher) {
+                try {
+                    val tTotalStartUs = System.nanoTime() / 1000L
 
-            val decoded = try {
-                decodePacketForUi(payload, activeRunId)
-            } catch (e: Exception) {
-                appendSensorLog("[DECODE ERROR] ${e.message}")
-                null
-            }
+                    val decoded = try {
+                        decodePacketForUi(payload, activeRunId)
+                    } catch (e: Exception) {
+                        return@withContext DecodeLoopResult(
+                            logMessage = "[DECODE ERROR] ${e.message}",
+                            wroteSamples = false
+                        )
+                    }
 
-            if (decoded == null) {
-                val preview = when (detectVariant(payload)) {
-                    Variant.TEXT -> textPreview(payload)
-                    Variant.BIN, Variant.BIN_ZC -> hexPreview(payload)
-                    Variant.UNKNOWN -> hexPreview(payload)
+                    if (decoded == null) {
+                        val preview = when (detectVariant(payload)) {
+                            Variant.TEXT -> textPreview(payload)
+                            Variant.BIN, Variant.BIN_ZC -> hexPreview(payload)
+                            Variant.UNKNOWN -> hexPreview(payload)
+                        }
+                        return@withContext DecodeLoopResult(
+                            logMessage = "[DROP] unsupported/foreign packet: $preview",
+                            wroteSamples = false
+                        )
+                    }
+
+                    if (!decoded.accepted) {
+                        val tTotalEndUs = System.nanoTime() / 1000L
+                        val totalUs = (tTotalEndUs - tTotalStartUs).coerceAtLeast(0L)
+
+                        synchronized(dataLock) {
+                            telemetryRows += PacketTelemetryRecord(
+                                variant = decoded.variant.code,
+                                repId = decoded.repId,
+                                seq = decoded.seq,
+                                tSendUs = decoded.tSendUs,
+                                tRecvEpochUs = tRecvEpochUs,
+                                tRecvMonoUs = tRecvMonoUs,
+                                espMinusPcOffsetUs = espMinusPcOffsetUs,
+                                sampleCount = decoded.sampleCount,
+                                channelCount = decoded.channelCount,
+                                sampleFmt = decoded.sampleFmt,
+                                bytesOnWire = decoded.payloadBytes,
+                                decodeUs = 0L,
+                                decodeTotalUs = totalUs,
+                                crcOk = decoded.crcOk,
+                                lenOk = decoded.lenOk,
+                                accepted = false,
+                                writtenSamples = 0
+                            )
+                        }
+
+                        return@withContext DecodeLoopResult(
+                            logMessage = "[DROP ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} lenOk=${decoded.lenOk} crcOk=${decoded.crcOk}",
+                            wroteSamples = false
+                        )
+                    }
+
+                    // Untuk TEXT dan BIN, body decode/materialize dilakukan di luar lock
+                    val predecodedSamples = try {
+                        materializeBodyOutsideLock(decoded, payload)
+                    } catch (e: Exception) {
+                        return@withContext DecodeLoopResult(
+                            logMessage = "[BODY PREP ERROR] ${e.message}",
+                            wroteSamples = false
+                        )
+                    }
+
+                    val tBodyStartUs = System.nanoTime() / 1000L
+
+                    val writtenSamples: Int = try {
+                        synchronized(dataLock) {
+                            val buf = rawBufByChannel.getOrPut(decoded.repId) { ShortRingBuffer(rawCap) }
+                            writeDecodedPacketToBuffer(
+                                decoded = decoded,
+                                payload = payload,
+                                buf = buf,
+                                predecodedSamples = predecodedSamples
+                            )
+                        }
+                    } catch (e: Exception) {
+                        return@withContext DecodeLoopResult(
+                            logMessage = "[WRITE ERROR] ${e.message}",
+                            wroteSamples = false
+                        )
+                    }
+
+                    val tBodyEndUs = System.nanoTime() / 1000L
+                    val bodyUs = (tBodyEndUs - tBodyStartUs).coerceAtLeast(0L)
+
+                    val tTotalEndUs = System.nanoTime() / 1000L
+                    val totalUs = (tTotalEndUs - tTotalStartUs).coerceAtLeast(0L)
+
+                    if (writtenSamples <= 0) {
+                        synchronized(dataLock) {
+                            telemetryRows += PacketTelemetryRecord(
+                                variant = decoded.variant.code,
+                                repId = decoded.repId,
+                                seq = decoded.seq,
+                                tSendUs = decoded.tSendUs,
+                                tRecvEpochUs = tRecvEpochUs,
+                                tRecvMonoUs = tRecvMonoUs,
+                                espMinusPcOffsetUs = espMinusPcOffsetUs,
+                                sampleCount = decoded.sampleCount,
+                                channelCount = decoded.channelCount,
+                                sampleFmt = decoded.sampleFmt,
+                                bytesOnWire = decoded.payloadBytes,
+                                decodeUs = bodyUs,
+                                decodeTotalUs = totalUs,
+                                crcOk = decoded.crcOk,
+                                lenOk = decoded.lenOk,
+                                accepted = false,
+                                writtenSamples = 0
+                            )
+                        }
+                        return@withContext DecodeLoopResult(wroteSamples = false)
+                    }
+
+                    var importantLog: String? = null
+
+                    synchronized(dataLock) {
+                        telemetryRows += PacketTelemetryRecord(
+                            variant = decoded.variant.code,
+                            repId = decoded.repId,
+                            seq = decoded.seq,
+                            tSendUs = decoded.tSendUs,
+                            tRecvEpochUs = tRecvEpochUs,
+                            tRecvMonoUs = tRecvMonoUs,
+                            espMinusPcOffsetUs = espMinusPcOffsetUs,
+                            sampleCount = decoded.sampleCount,
+                            channelCount = decoded.channelCount,
+                            sampleFmt = decoded.sampleFmt,
+                            bytesOnWire = decoded.payloadBytes,
+                            decodeUs = bodyUs,
+                            decodeTotalUs = totalUs,
+                            crcOk = decoded.crcOk,
+                            lenOk = decoded.lenOk,
+                            accepted = true,
+                            writtenSamples = writtenSamples
+                        )
+
+                        val buf = rawBufByChannel[decoded.repId]
+                        if (buf != null) {
+                            val prevSeq = lastSeqByRep[decoded.repId]
+                            lastSeqByRep[decoded.repId] = decoded.seq
+
+                            val processingStart = (buf.oldestSeq() + processingSkipFirstSamples)
+                                .coerceAtMost(buf.newestSeqExclusive())
+
+                            val cur = nextSeqToProcess[decoded.repId]
+                            if (cur == null) {
+                                nextSeqToProcess[decoded.repId] = processingStart
+                            } else if (cur < processingStart) {
+                                nextSeqToProcess[decoded.repId] = processingStart
+                            }
+
+                            filtBufByChannel.getOrPut(decoded.repId) { DoubleRingBuffer(filtCap) }
+
+                            importantLog =
+                                if (prevSeq != null && decoded.seq > prevSeq + 1L) {
+                                    "[GAP] rep=${decoded.repId} prev_seq=$prevSeq current_seq=${decoded.seq} missing=${decoded.seq - prevSeq - 1L}"
+                                } else {
+                                    null
+                                }
+                        }
+                    }
+
+                    return@withContext DecodeLoopResult(
+                        logMessage = importantLog,
+                        wroteSamples = true
+                    )
+                } catch (e: Exception) {
+                    DecodeLoopResult(
+                        logMessage = "[PIPELINE ERROR] ${e.message}",
+                        wroteSamples = false
+                    )
                 }
-                appendSensorLog("[DROP] unsupported/foreign packet: $preview")
-                continue
             }
 
-            if (!decoded.accepted) {
-                val tDecodeEndUs = System.nanoTime() / 1000L
-                val decodeUs = (tDecodeEndUs - tDecodeStartUs).coerceAtLeast(0L)
+            decodeResult.logMessage?.let { appendSensorLog(it) }
 
-                telemetryRows += PacketTelemetryRecord(
-                    variant = decoded.variant.code,
-                    repId = decoded.repId,
-                    seq = decoded.seq,
-                    tSendUs = decoded.tSendUs,
-                    tRecvEpochUs = tRecvEpochUs,
-                    tRecvMonoUs = tRecvMonoUs,
-                    espMinusPcOffsetUs = espMinusPcOffsetUs,
-                    sampleCount = decoded.sampleCount,
-                    channelCount = decoded.channelCount,
-                    sampleFmt = decoded.sampleFmt,
-                    bytesOnWire = decoded.payloadBytes,
-                    decodeUs = decodeUs,
-                    crcOk = decoded.crcOk,
-                    lenOk = decoded.lenOk,
-                    accepted = false,
-                    writtenSamples = 0
-                )
-
-                appendSensorLog(
-                    "[DROP ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} " +
-                            "lenOk=${decoded.lenOk} crcOk=${decoded.crcOk}"
-                )
-                continue
+            // refresh UI hanya saat run selesai / idle
+            if (!runInProgress && decodeResult.wroteSamples) {
+                uiTick++
+                showPlot = true
+                showFftPlot = false
             }
-
-            val buf = rawBufByChannel.getOrPut(decoded.repId) { IntRingBuffer(rawCap) }
-
-            val writtenSamples = try {
-                writeDecodedPacketToBuffer(decoded, payload, buf)
-            } catch (e: Exception) {
-                appendSensorLog("[WRITE ERROR] ${e.message}")
-                0
-            }
-
-            val tDecodeEndUs = System.nanoTime() / 1000L
-            val decodeUs = (tDecodeEndUs - tDecodeStartUs).coerceAtLeast(0L)
-
-            telemetryRows += PacketTelemetryRecord(
-                variant = decoded.variant.code,
-                repId = decoded.repId,
-                seq = decoded.seq,
-                tSendUs = decoded.tSendUs,
-                tRecvEpochUs = tRecvEpochUs,
-                tRecvMonoUs = tRecvMonoUs,
-                espMinusPcOffsetUs = espMinusPcOffsetUs,
-                sampleCount = decoded.sampleCount,
-                channelCount = decoded.channelCount,
-                sampleFmt = decoded.sampleFmt,
-                bytesOnWire = decoded.payloadBytes,
-                decodeUs = decodeUs,
-                crcOk = decoded.crcOk,
-                lenOk = decoded.lenOk,
-                accepted = writtenSamples > 0,
-                writtenSamples = writtenSamples
-            )
-
-            if (writtenSamples <= 0) continue
-
-            val prevSeq = lastSeqByRep[decoded.repId]
-            if (prevSeq != null && decoded.seq > prevSeq + 1L) {
-                appendSensorLog(
-                    "[GAP] rep=${decoded.repId} prev_seq=$prevSeq current_seq=${decoded.seq} missing=${decoded.seq - prevSeq - 1L}"
-                )
-            }
-            lastSeqByRep[decoded.repId] = decoded.seq
-
-            if ((decoded.seq % 16L) == 0L) {
-                appendSensorLog(
-                    "[PKT ${decoded.variant.label}] rep=${decoded.repId} seq=${decoded.seq} " +
-                            "samples=$writtenSamples bytes=${decoded.payloadBytes} decode=${decodeUs}us"
-                )
-            }
-
-            val cur = nextSeqToProcess[decoded.repId]
-            val processingStart = (buf.oldestSeq() + processingSkipFirstSamples)
-                .coerceAtMost(buf.newestSeqExclusive())
-
-            if (cur == null) {
-                nextSeqToProcess[decoded.repId] = processingStart
-            } else if (cur < processingStart) {
-                nextSeqToProcess[decoded.repId] = processingStart
-            }
-
-            filtBufByChannel.getOrPut(decoded.repId) { DoubleRingBuffer(filtCap) }
-
-            uiTick++
-            showPlot = true
-            showFftPlot = false
         }
     }
 
@@ -1584,55 +1734,78 @@ fun DesktopUI() {
                 fftUseAutoBand = fftUseAutoBand
             )
 
-            var processedAny = false
+            val tasks = synchronized(dataLock) {
+                val out = mutableListOf<ProcessingTask>()
 
-            for (ch in rawBufByChannel.keys.sorted()) {
-                val rawBuf = rawBufByChannel[ch] ?: continue
-                val filtBuf = filtBufByChannel.getOrPut(ch) { DoubleRingBuffer(filtCap) }
+                for (ch in rawBufByChannel.keys.sorted()) {
+                    val rawBuf = rawBufByChannel[ch] ?: continue
 
-                val minProcessingStart = (rawBuf.oldestSeq() + processingSkipFirstSamples)
-                    .coerceAtMost(rawBuf.newestSeqExclusive())
+                    val minProcessingStart = (rawBuf.oldestSeq() + processingSkipFirstSamples)
+                        .coerceAtMost(rawBuf.newestSeqExclusive())
 
-                var seq = nextSeqToProcess[ch] ?: minProcessingStart
-                if (seq < minProcessingStart) seq = minProcessingStart
+                    var seq = nextSeqToProcess[ch] ?: minProcessingStart
+                    if (seq < minProcessingStart) seq = minProcessingStart
 
-                var processed = 0
-                while (seq < rawBuf.newestSeqExclusive() && processed < maxChunksPerTickPerChannel) {
-                    val chunk = rawBuf.readChunk(seq, chunkSize)
-                    if (chunk.isEmpty()) break
+                    var prepared = 0
+                    while (seq < rawBuf.newestSeqExclusive() && prepared < maxChunksPerTickPerChannel) {
+                        val chunk = rawBuf.readChunk(seq, chunkSize)
+                        if (chunk.isEmpty()) break
 
-                    val filterOverlap = if (params.type == "SG") {
-                        (params.sgWindow - 1).coerceAtLeast(0)
-                    } else {
-                        0
+                        val filterOverlap = if (params.type == "SG") {
+                            (params.sgWindow - 1).coerceAtLeast(0)
+                        } else {
+                            0
+                        }
+                        val tailLen = max(filterOverlap, analysisLookback)
+                        val tail = if (tailLen > 0) rawBuf.readChunk(seq - tailLen, tailLen) else IntArray(0)
+
+                        out += ProcessingTask(
+                            channel = ch,
+                            seqStart = seq,
+                            rawTail = tail,
+                            rawChunk = chunk
+                        )
+
+                        seq += chunk.size
+                        prepared += 1
                     }
-                    val tailLen = max(filterOverlap, analysisLookback)
-                    val tail = if (tailLen > 0) rawBuf.readChunk(seq - tailLen, tailLen) else IntArray(0)
 
-                    val resp = processor.process(
-                        channel = ch,
-                        seqStart = seq,
-                        rawTail = tail,
-                        rawChunk = chunk,
-                        params = params
-                    )
-
-                    if (resp.paramsVersion != paramsVersion) break
-
-                    filtBuf.appendAll(resp.filtered)
-
-                    peakCountByRep[ch] = resp.peakCount
-                    fftDominantFreqByRep[ch] = resp.fftDominantFreq
-                    fftDominantAmpByRep[ch] = resp.fftDominantAmp
-                    fftFreqByRep[ch] = resp.fftFreq
-                    fftSpecByRep[ch] = resp.fftSpec
-
-                    seq += chunk.size
-                    processed++
-                    processedAny = true
+                    nextSeqToProcess[ch] = seq
                 }
 
-                nextSeqToProcess[ch] = seq
+                out
+            }
+
+            var processedAny = false
+
+            for (task in tasks) {
+                val resp = try {
+                    processor.process(
+                        channel = task.channel,
+                        seqStart = task.seqStart,
+                        rawTail = task.rawTail,
+                        rawChunk = task.rawChunk,
+                        params = params
+                    )
+                } catch (e: Exception) {
+                    appendSensorLog("[PROCESS ERROR] ch=${task.channel}: ${e.message}")
+                    continue
+                }
+
+                if (resp.paramsVersion != paramsVersion) continue
+
+                synchronized(dataLock) {
+                    val filtBuf = filtBufByChannel.getOrPut(task.channel) { DoubleRingBuffer(filtCap) }
+                    filtBuf.appendAll(resp.filtered)
+
+                    peakCountByRep[task.channel] = resp.peakCount
+                    fftDominantFreqByRep[task.channel] = resp.fftDominantFreq
+                    fftDominantAmpByRep[task.channel] = resp.fftDominantAmp
+                    fftFreqByRep[task.channel] = resp.fftFreq
+                    fftSpecByRep[task.channel] = resp.fftSpec
+                }
+
+                processedAny = true
             }
 
             if (processedAny) {
@@ -1643,14 +1816,16 @@ fun DesktopUI() {
 
     val rawMapForPlot by remember(uiTick) {
         derivedStateOf {
-            rawBufByChannel.mapValues { (_, buf) ->
-                val startSeq = (buf.oldestSeq() + processingSkipFirstSamples)
-                    .coerceAtMost(buf.newestSeqExclusive())
-                val count = (buf.newestSeqExclusive() - startSeq).toInt().coerceAtLeast(0)
-                if (count <= 0) {
-                    emptyList()
-                } else {
-                    buf.readChunk(startSeq, min(plotMaxPoints, count)).toList()
+            synchronized(dataLock) {
+                rawBufByChannel.mapValues { (_, buf) ->
+                    val startSeq = (buf.oldestSeq() + processingSkipFirstSamples)
+                        .coerceAtMost(buf.newestSeqExclusive())
+                    val count = (buf.newestSeqExclusive() - startSeq).toInt().coerceAtLeast(0)
+                    if (count <= 0) {
+                        emptyList()
+                    } else {
+                        buf.readChunk(startSeq, min(plotMaxPoints, count)).toList()
+                    }
                 }
             }
         }
@@ -1658,7 +1833,9 @@ fun DesktopUI() {
 
     val filteredMapForPlot by remember(procTick) {
         derivedStateOf {
-            filtBufByChannel.mapValues { (_, buf) -> buf.snapshotLast(plotMaxPoints) }
+            synchronized(dataLock) {
+                filtBufByChannel.mapValues { (_, buf) -> buf.snapshotLast(plotMaxPoints) }
+            }
         }
     }
 
@@ -1760,6 +1937,7 @@ fun DesktopUI() {
                                     )
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         Button(
+                                            enabled = !runInProgress,
                                             onClick = {
                                                 if (plotRepetitions.isEmpty()) {
                                                     dialogInfo = UiDialogInfo("Signal plot belum tersedia", "Belum ada data repetition yang bisa ditampilkan. Jalankan akuisisi data terlebih dahulu.")
@@ -1776,6 +1954,7 @@ fun DesktopUI() {
                                             shape = RoundedCornerShape(12.dp)
                                         ) { Text("Signal Plot", fontWeight = FontWeight.SemiBold) }
                                         Button(
+                                            enabled = !runInProgress,
                                             onClick = {
                                                 val rep = selectedPlotRep
                                                 val hasFftData = rep != null && (fftFreqMapForPlot[rep]?.size ?: 0) >= 2 && (fftSpecMapForPlot[rep]?.size ?: 0) >= 2
@@ -1817,22 +1996,34 @@ fun DesktopUI() {
                                         .fillMaxWidth()
                                         .weight(1f)
                                 ) {
-                                    if (showFftPlot) {
-                                        PythonFftPlotSection(
-                                            processor = processor,
-                                            paramsVersion = paramsVersion,
-                                            channel = selectedPlotRep,
-                                            fftFreq = fftFreqMapForPlot[selectedPlotRep] ?: doubleArrayOf(),
-                                            fftSpec = fftSpecMapForPlot[selectedPlotRep] ?: doubleArrayOf()
-                                        )
+                                    if (runInProgress) {
+                                        Box(
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Text(
+                                                "Plot paused during benchmark :)",
+                                                color = PremiumTokens.TextMuted
+                                            )
+                                        }
                                     } else {
-                                        PythonSignalPlotSection(
-                                            processor = processor,
-                                            paramsVersion = paramsVersion,
-                                            channel = selectedPlotRep,
-                                            rawSnapshot = rawMapForPlot[selectedPlotRep].orEmpty(),
-                                            filteredSnapshot = filteredMapForPlot[selectedPlotRep].orEmpty()
-                                        )
+                                        if (showFftPlot) {
+                                            PythonFftPlotSection(
+                                                processor = processor,
+                                                paramsVersion = paramsVersion,
+                                                channel = selectedPlotRep,
+                                                fftFreq = fftFreqMapForPlot[selectedPlotRep] ?: doubleArrayOf(),
+                                                fftSpec = fftSpecMapForPlot[selectedPlotRep] ?: doubleArrayOf()
+                                            )
+                                        } else {
+                                            PythonSignalPlotSection(
+                                                processor = processor,
+                                                paramsVersion = paramsVersion,
+                                                channel = selectedPlotRep,
+                                                rawSnapshot = rawMapForPlot[selectedPlotRep].orEmpty(),
+                                                filteredSnapshot = filteredMapForPlot[selectedPlotRep].orEmpty()
+                                            )
+                                        }
                                     }
                                 }
                             }

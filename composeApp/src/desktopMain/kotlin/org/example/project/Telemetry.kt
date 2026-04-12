@@ -18,7 +18,14 @@ data class PacketTelemetryRecord(
     val channelCount: Int,
     val sampleFmt: Int,
     val bytesOnWire: Int,          // len(payload) for all variants
-    val decodeUs: Long,            // parse + decode + store
+
+    // Dipakai untuk summary decode_p50_us / decode_p99_us:
+    // BODY decode + store saja (lebih fair untuk BIN vs BIN+ZC)
+    val decodeUs: Long,
+
+    // Opsional untuk debugging: parse + validate + crc + body decode + store
+    val decodeTotalUs: Long? = null,
+
     val crcOk: Boolean? = null,
     val lenOk: Boolean? = null,
     val accepted: Boolean,
@@ -338,7 +345,7 @@ fun exportPacketTelemetryCsv(records: List<PacketTelemetryRecord>): File {
     file.bufferedWriter().use { w ->
         w.appendLine(
             "variant,rep_id,seq,t_send_us,t_recv_epoch_us,t_recv_mono_us,esp_minus_pc_offset_us," +
-                    "sample_count,channel_count,sample_fmt,bytes_on_wire,decode_us,crc_ok,len_ok,accepted,written_samples"
+                    "sample_count,channel_count,sample_fmt,bytes_on_wire,decode_us,decode_total_us,crc_ok,len_ok,accepted,written_samples"
         )
         records.forEach { r ->
             w.appendLine(
@@ -355,6 +362,7 @@ fun exportPacketTelemetryCsv(records: List<PacketTelemetryRecord>): File {
                     r.sampleFmt,
                     r.bytesOnWire,
                     r.decodeUs,
+                    r.decodeTotalUs?.toString() ?: "",
                     r.crcOk?.toString() ?: "",
                     r.lenOk?.toString() ?: "",
                     r.accepted,
