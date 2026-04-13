@@ -950,11 +950,10 @@ private fun materializeBodyOutsideLock(
 
         Variant.BIN -> {
             val payloadOffset = decoded.payloadOffset ?: return ShortArray(0)
-            val totalSamples = decoded.sampleCount * decoded.channelCount
             decodeInt16LeToShortArray(
                 src = payload,
                 offset = payloadOffset,
-                sampleCount = totalSamples
+                sampleCount = decoded.sampleCount * decoded.channelCount
             )
         }
 
@@ -963,34 +962,22 @@ private fun materializeBodyOutsideLock(
     }
 }
 
+private fun elapsedUsSince(startNs: Long): Double =
+    (System.nanoTime() - startNs).coerceAtLeast(0L) / 1000.0
+
 private fun writeDecodedPacketToBuffer(
     decoded: UiDecodedPacket,
-    payload: ByteArray,
     buf: ShortRingBuffer,
-    predecodedSamples: ShortArray? = null
+    predecodedSamples: ShortArray
 ): Int {
     return when (decoded.variant) {
         Variant.TEXT,
         Variant.BIN -> {
-            val samples = predecodedSamples ?: ShortArray(0)
-            if (samples.isEmpty()) 0 else {
-                buf.appendAll(samples)
-                samples.size
-            }
+            if (predecodedSamples.isEmpty()) 0 else buf.appendAll(predecodedSamples)
         }
 
-        Variant.BIN_ZC -> {
-            val payloadOffset = decoded.payloadOffset ?: return 0
-            val totalSamples = decoded.sampleCount * decoded.channelCount
-            decodeInt16LeIntoCount(
-                src = payload,
-                offset = payloadOffset,
-                sampleCount = totalSamples,
-                sink = buf
-            )
-        }
-
-        Variant.UNKNOWN -> 0
+        Variant.UNKNOWN,
+        Variant.BIN_ZC -> 0
     }
 }
 
@@ -1079,9 +1066,7 @@ fun DesktopUI() {
 
     val usePython = true
     val pythonClient = remember { PythonProcessorClient(resourcePath = "worker/python_worker.py") }
-    val processor: ProcessorClient = remember {
-        if (usePython) pythonClient else LocalProcessorClient(kalmanXByChannel, kalmanPByChannel)
-    }
+    val processor: ProcessorClient = remember { pythonClient }
 
     var uiTick by remember { mutableStateOf(0L) }
     var procTick by remember { mutableStateOf(0L) }
@@ -1230,10 +1215,18 @@ fun DesktopUI() {
         pythonClient.stop()
         sensorMessagesList.clear()
 
+        val repCount = repetitions.toIntOrNull() ?: return false
+
         synchronized(dataLock) {
             rawBufByChannel.clear()
             filtBufByChannel.clear()
             nextSeqToProcess.clear()
+
+            for (rep in 1..repCount) {
+                rawBufByChannel[rep] = ShortRingBuffer(rawCap)
+                filtBufByChannel[rep] = DoubleRingBuffer(filtCap)
+                nextSeqToProcess[rep] = 0L
+            }
 
             peakCountByRep.clear()
             fftDominantFreqByRep.clear()
@@ -1518,7 +1511,7 @@ fun DesktopUI() {
 
             val decodeResult = withContext(decodeDispatcher) {
                 try {
-                    val tTotalStartUs = System.nanoTime() / 1000L
+                    val tTotalStartNs = System.nanoTime()
 
                     val decoded = try {
                         decodePacketForUi(payload, activeRunId)
@@ -1542,8 +1535,7 @@ fun DesktopUI() {
                     }
 
                     if (!decoded.accepted) {
-                        val tTotalEndUs = System.nanoTime() / 1000L
-                        val totalUs = (tTotalEndUs - tTotalStartUs).coerceAtLeast(0L)
+                        val totalUs = elapsedUsSince(tTotalStartNs)
 
                         synchronized(dataLock) {
                             telemetryRows += PacketTelemetryRecord(
@@ -1558,7 +1550,7 @@ fun DesktopUI() {
                                 channelCount = decoded.channelCount,
                                 sampleFmt = decoded.sampleFmt,
                                 bytesOnWire = decoded.payloadBytes,
-                                decodeUs = 0L,
+                                decodeUs = 0.0,
                                 decodeTotalUs = totalUs,
                                 crcOk = decoded.crcOk,
                                 lenOk = decoded.lenOk,
@@ -1573,9 +1565,20 @@ fun DesktopUI() {
                         )
                     }
 
-                    // Untuk TEXT dan BIN, body decode/materialize dilakukan di luar lock
+                    val rawBuf = synchronized(dataLock) {
+                        rawBufByChannel[decoded.repId]
+                    } ?: return@withContext DecodeLoopResult(
+                        logMessage = "[WRITE ERROR] rawBuf missing for rep=${decoded.repId}",
+                        wroteSamples = false
+                    )
+
+                    val tBodyStartNs = System.nanoTime()
+
                     val predecodedSamples = try {
-                        materializeBodyOutsideLock(decoded, payload)
+                        when (decoded.variant) {
+                            Variant.TEXT, Variant.BIN -> materializeBodyOutsideLock(decoded, payload)
+                            Variant.BIN_ZC, Variant.UNKNOWN -> null
+                        }
                     } catch (e: Exception) {
                         return@withContext DecodeLoopResult(
                             logMessage = "[BODY PREP ERROR] ${e.message}",
@@ -1583,17 +1586,45 @@ fun DesktopUI() {
                         )
                     }
 
-                    val tBodyStartUs = System.nanoTime() / 1000L
+                    val benchmarkExclusive = isolateDecodeBenchmarkDuringRun && runInProgress
 
                     val writtenSamples: Int = try {
-                        synchronized(dataLock) {
-                            val buf = rawBufByChannel.getOrPut(decoded.repId) { ShortRingBuffer(rawCap) }
-                            writeDecodedPacketToBuffer(
-                                decoded = decoded,
-                                payload = payload,
-                                buf = buf,
-                                predecodedSamples = predecodedSamples
-                            )
+                        when (decoded.variant) {
+                            Variant.TEXT, Variant.BIN -> {
+                                val samples = predecodedSamples ?: ShortArray(0)
+                                if (benchmarkExclusive) {
+                                    writeDecodedPacketToBuffer(decoded, rawBuf, samples)
+                                } else {
+                                    synchronized(dataLock) {
+                                        writeDecodedPacketToBuffer(decoded, rawBuf, samples)
+                                    }
+                                }
+                            }
+
+                            Variant.BIN_ZC -> {
+                                val payloadOffset = decoded.payloadOffset ?: return@withContext DecodeLoopResult(
+                                    logMessage = "[WRITE ERROR] payloadOffset null",
+                                    wroteSamples = false
+                                )
+
+                                if (benchmarkExclusive) {
+                                    rawBuf.appendDecodedInt16LeFromByteArrayFast(
+                                        src = payload,
+                                        offset = payloadOffset,
+                                        sampleCount = decoded.sampleCount * decoded.channelCount
+                                    )
+                                } else {
+                                    synchronized(dataLock) {
+                                        rawBuf.appendDecodedInt16LeFromByteArrayFast(
+                                            src = payload,
+                                            offset = payloadOffset,
+                                            sampleCount = decoded.sampleCount * decoded.channelCount
+                                        )
+                                    }
+                                }
+                            }
+
+                            Variant.UNKNOWN -> 0
                         }
                     } catch (e: Exception) {
                         return@withContext DecodeLoopResult(
@@ -1602,11 +1633,8 @@ fun DesktopUI() {
                         )
                     }
 
-                    val tBodyEndUs = System.nanoTime() / 1000L
-                    val bodyUs = (tBodyEndUs - tBodyStartUs).coerceAtLeast(0L)
-
-                    val tTotalEndUs = System.nanoTime() / 1000L
-                    val totalUs = (tTotalEndUs - tTotalStartUs).coerceAtLeast(0L)
+                    val bodyUs = elapsedUsSince(tBodyStartNs)
+                    val totalUs = elapsedUsSince(tTotalStartNs)
 
                     if (writtenSamples <= 0) {
                         synchronized(dataLock) {
@@ -1671,7 +1699,7 @@ fun DesktopUI() {
                                 nextSeqToProcess[decoded.repId] = processingStart
                             }
 
-                            filtBufByChannel.getOrPut(decoded.repId) { DoubleRingBuffer(filtCap) }
+                            filtBufByChannel[decoded.repId]
 
                             importantLog =
                                 if (prevSeq != null && decoded.seq > prevSeq + 1L) {

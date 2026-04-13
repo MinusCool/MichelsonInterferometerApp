@@ -21,10 +21,10 @@ data class PacketTelemetryRecord(
 
     // Dipakai untuk summary decode_p50_us / decode_p99_us:
     // BODY decode + store saja (lebih fair untuk BIN vs BIN+ZC)
-    val decodeUs: Long,
+    val decodeUs: Double,
 
     // Opsional untuk debugging: parse + validate + crc + body decode + store
-    val decodeTotalUs: Long? = null,
+    val decodeTotalUs: Double? = null,
 
     val crcOk: Boolean? = null,
     val lenOk: Boolean? = null,

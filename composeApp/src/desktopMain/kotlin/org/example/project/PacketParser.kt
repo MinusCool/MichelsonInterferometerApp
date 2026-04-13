@@ -200,32 +200,6 @@ fun decodeInt16LeToShortArray(
     return out
 }
 
-fun decodeInt16LeInto(
-    src: ByteArray,
-    offset: Int,
-    sampleCount: Int,
-    sink: ShortRingBuffer
-) {
-    sink.appendDecodedInt16LeFromByteArray(
-        src = src,
-        offset = offset,
-        sampleCount = sampleCount
-    )
-}
-
-fun decodeInt16LeIntoCount(
-    src: ByteArray,
-    offset: Int,
-    sampleCount: Int,
-    sink: ShortRingBuffer
-): Int {
-    return sink.appendDecodedInt16LeFromByteArray(
-        src = src,
-        offset = offset,
-        sampleCount = sampleCount
-    )
-}
-
 fun decodeControlText(payload: ByteArray): String =
     payload.toString(Charsets.UTF_8).trim().removeSurrounding("\"").trim()
 
@@ -245,4 +219,22 @@ private fun ByteArray.startsWithPrefix(prefix: ByteArray): Boolean {
         if (this[i] != prefix[i]) return false
     }
     return true
+}
+
+fun decodeInt16LeIntoShortArray(
+    src: ByteArray,
+    offset: Int,
+    sampleCount: Int,
+    dst: ShortArray,
+    dstOffset: Int
+) {
+    var p = offset
+    var d = dstOffset
+    repeat(sampleCount) {
+        val lo = src[p].toInt() and 0xFF
+        val hi = src[p + 1].toInt()
+        dst[d] = ((hi shl 8) or lo).toShort()
+        p += 2
+        d += 1
+    }
 }
