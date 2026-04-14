@@ -19,11 +19,15 @@ data class PacketTelemetryRecord(
     val sampleFmt: Int,
     val bytesOnWire: Int,          // len(payload) for all variants
 
-    // Dipakai untuk summary decode_p50_us / decode_p99_us:
-    // BODY decode + store saja (lebih fair untuk BIN vs BIN+ZC)
+    // Tetap dipakai untuk validator C2:
+    // BODY decode + store saja (fair untuk BIN vs BIN+ZC)
     val decodeUs: Double,
 
-    // Opsional untuk debugging: parse + validate + crc + body decode + store
+    // Baru: parse + body decode + store
+    // dipakai untuk perbandingan adil TEXT vs BIN vs BIN+ZC
+    val decodeCompareUs: Double? = null,
+
+    // Total: parse + validate + crc + body decode + store + bookkeeping minimum
     val decodeTotalUs: Double? = null,
 
     val crcOk: Boolean? = null,
@@ -70,9 +74,15 @@ data class RepTelemetrySummary(
     val latencyP50Us: Double,
     val latencyP99Us: Double,
     val latencyJitterUs: Double,
+
     val decodeP50Us: Double,
     val decodeP99Us: Double,
     val decodeJitterUs: Double,
+
+    val decodeCompareP50Us: Double,
+    val decodeCompareP99Us: Double,
+    val decodeCompareJitterUs: Double,
+
     val throughputSamplesPerSec: Double,
     val crcBad: Int,
     val lenBad: Int,
@@ -88,9 +98,15 @@ data class RunTelemetrySummary(
     val latencyP50Us: Double,
     val latencyP99Us: Double,
     val latencyJitterUs: Double,
+
     val decodeP50Us: Double,
     val decodeP99Us: Double,
     val decodeJitterUs: Double,
+
+    val decodeCompareP50Us: Double,
+    val decodeCompareP99Us: Double,
+    val decodeCompareJitterUs: Double,
+
     val throughputSamplesPerSec: Double,
     val crcBad: Int,
     val lenBad: Int,
@@ -185,6 +201,8 @@ fun buildPerRepTelemetrySummaries(records: List<PacketTelemetryRecord>): List<Re
 
             if (validPackets.isEmpty()) {
                 val dAll = packetList.map { it.decodeUs.toDouble() }
+                val dCompareAll = packetList.mapNotNull { it.decodeCompareUs }
+
                 return@map RepTelemetrySummary(
                     variant = variant,
                     repId = repId,
@@ -194,9 +212,15 @@ fun buildPerRepTelemetrySummaries(records: List<PacketTelemetryRecord>): List<Re
                     latencyP50Us = Double.NaN,
                     latencyP99Us = Double.NaN,
                     latencyJitterUs = Double.NaN,
+
                     decodeP50Us = percentile(dAll, 50.0),
                     decodeP99Us = percentile(dAll, 99.0),
                     decodeJitterUs = percentile(dAll, 99.0) - percentile(dAll, 50.0),
+
+                    decodeCompareP50Us = percentile(dCompareAll, 50.0),
+                    decodeCompareP99Us = percentile(dCompareAll, 99.0),
+                    decodeCompareJitterUs = percentile(dCompareAll, 99.0) - percentile(dCompareAll, 50.0),
+
                     throughputSamplesPerSec = 0.0,
                     crcBad = crcBad,
                     lenBad = lenBad,
@@ -207,12 +231,16 @@ fun buildPerRepTelemetrySummaries(records: List<PacketTelemetryRecord>): List<Re
 
             val latencies = validPackets.map(::packetLatencyUs)
             val decodes = validPackets.map { it.decodeUs.toDouble() }
+            val decodeCompare = validPackets.mapNotNull { it.decodeCompareUs }
             val bytesAll = packetList.map { it.bytesOnWire.toDouble() }
 
             val p50L = percentile(latencies, 50.0)
             val p99L = percentile(latencies, 99.0)
             val p50D = percentile(decodes, 50.0)
             val p99D = percentile(decodes, 99.0)
+
+            val p50DC = percentile(decodeCompare, 50.0)
+            val p99DC = percentile(decodeCompare, 99.0)
 
             val totalSamples = validPackets.sumOf { it.writtenSamples.toLong() }
 
@@ -231,9 +259,15 @@ fun buildPerRepTelemetrySummaries(records: List<PacketTelemetryRecord>): List<Re
                 latencyP50Us = p50L,
                 latencyP99Us = p99L,
                 latencyJitterUs = p99L - p50L,
+
                 decodeP50Us = p50D,
                 decodeP99Us = p99D,
                 decodeJitterUs = p99D - p50D,
+
+                decodeCompareP50Us = p50DC,
+                decodeCompareP99Us = p99DC,
+                decodeCompareJitterUs = p99DC - p50DC,
+
                 throughputSamplesPerSec = throughput,
                 crcBad = crcBad,
                 lenBad = lenBad,
@@ -253,9 +287,15 @@ fun buildRunTelemetrySummary(records: List<PacketTelemetryRecord>): RunTelemetry
             latencyP50Us = Double.NaN,
             latencyP99Us = Double.NaN,
             latencyJitterUs = Double.NaN,
+
             decodeP50Us = Double.NaN,
             decodeP99Us = Double.NaN,
             decodeJitterUs = Double.NaN,
+
+            decodeCompareP50Us = Double.NaN,
+            decodeCompareP99Us = Double.NaN,
+            decodeCompareJitterUs = Double.NaN,
+
             throughputSamplesPerSec = Double.NaN,
             crcBad = 0,
             lenBad = 0,
@@ -276,6 +316,8 @@ fun buildRunTelemetrySummary(records: List<PacketTelemetryRecord>): RunTelemetry
 
     if (validPackets.isEmpty()) {
         val dAll = allPackets.map { it.decodeUs.toDouble() }
+        val dCompareAll = allPackets.mapNotNull { it.decodeCompareUs }
+
         return RunTelemetrySummary(
             variant = variant,
             packets = allPackets.size,
@@ -284,9 +326,15 @@ fun buildRunTelemetrySummary(records: List<PacketTelemetryRecord>): RunTelemetry
             latencyP50Us = Double.NaN,
             latencyP99Us = Double.NaN,
             latencyJitterUs = Double.NaN,
+
             decodeP50Us = percentile(dAll, 50.0),
             decodeP99Us = percentile(dAll, 99.0),
             decodeJitterUs = percentile(dAll, 99.0) - percentile(dAll, 50.0),
+
+            decodeCompareP50Us = percentile(dCompareAll, 50.0),
+            decodeCompareP99Us = percentile(dCompareAll, 99.0),
+            decodeCompareJitterUs = percentile(dCompareAll, 99.0) - percentile(dCompareAll, 50.0),
+
             throughputSamplesPerSec = 0.0,
             crcBad = crcBad,
             lenBad = lenBad,
@@ -298,11 +346,9 @@ fun buildRunTelemetrySummary(records: List<PacketTelemetryRecord>): RunTelemetry
 
     val latencies = validPackets.map(::packetLatencyUs)
     val decodes = validPackets.map { it.decodeUs.toDouble() }
+    val decodeCompare = validPackets.mapNotNull { it.decodeCompareUs }
     val totalSamples = validPackets.sumOf { it.writtenSamples.toLong() }
 
-    // R = N_samples / T
-    // Untuk run agregat, T juga dipakai dari domain waktu sender (t_send_us),
-    // bukan receive-window di receiver.
     val dtSec = durationSecFromSenderTimestamps(validPackets)
     val throughput = if (dtSec > 0.0) totalSamples / dtSec else 0.0
 
@@ -310,6 +356,9 @@ fun buildRunTelemetrySummary(records: List<PacketTelemetryRecord>): RunTelemetry
     val p99L = percentile(latencies, 99.0)
     val p50D = percentile(decodes, 50.0)
     val p99D = percentile(decodes, 99.0)
+
+    val p50DC = percentile(decodeCompare, 50.0)
+    val p99DC = percentile(decodeCompare, 99.0)
 
     return RunTelemetrySummary(
         variant = variant,
@@ -319,9 +368,15 @@ fun buildRunTelemetrySummary(records: List<PacketTelemetryRecord>): RunTelemetry
         latencyP50Us = p50L,
         latencyP99Us = p99L,
         latencyJitterUs = p99L - p50L,
+
         decodeP50Us = p50D,
         decodeP99Us = p99D,
         decodeJitterUs = p99D - p50D,
+
+        decodeCompareP50Us = p50DC,
+        decodeCompareP99Us = p99DC,
+        decodeCompareJitterUs = p99DC - p50DC,
+
         throughputSamplesPerSec = throughput,
         crcBad = crcBad,
         lenBad = lenBad,
@@ -345,7 +400,7 @@ fun exportPacketTelemetryCsv(records: List<PacketTelemetryRecord>): File {
     file.bufferedWriter().use { w ->
         w.appendLine(
             "variant,rep_id,seq,t_send_us,t_recv_epoch_us,t_recv_mono_us,esp_minus_pc_offset_us," +
-                    "sample_count,channel_count,sample_fmt,bytes_on_wire,decode_us,decode_total_us,crc_ok,len_ok,accepted,written_samples"
+                    "sample_count,channel_count,sample_fmt,bytes_on_wire,decode_us,decode_compare_us,decode_total_us,crc_ok,len_ok,accepted,written_samples"
         )
         records.forEach { r ->
             w.appendLine(
@@ -362,6 +417,7 @@ fun exportPacketTelemetryCsv(records: List<PacketTelemetryRecord>): File {
                     r.sampleFmt,
                     r.bytesOnWire,
                     r.decodeUs,
+                    r.decodeCompareUs?.toString() ?: "",
                     r.decodeTotalUs?.toString() ?: "",
                     r.crcOk?.toString() ?: "",
                     r.lenOk?.toString() ?: "",
@@ -384,6 +440,7 @@ fun exportRunTelemetrySummaryCsv(
             "scope,variant,rep_id,packets,total_samples,avg_bytes_on_wire," +
                     "latency_p50_us,latency_p99_us,latency_jitter_us," +
                     "decode_p50_us,decode_p99_us,decode_jitter_us," +
+                    "decode_compare_p50_us,decode_compare_p99_us,decode_compare_jitter_us," +
                     "throughput_samples_per_sec,crc_bad,len_bad,q,duration_sec,repetition_count"
         )
 
@@ -402,6 +459,9 @@ fun exportRunTelemetrySummaryCsv(
                     r.decodeP50Us,
                     r.decodeP99Us,
                     r.decodeJitterUs,
+                    r.decodeCompareP50Us,
+                    r.decodeCompareP99Us,
+                    r.decodeCompareJitterUs,
                     r.throughputSamplesPerSec,
                     r.crcBad,
                     r.lenBad,
@@ -426,6 +486,9 @@ fun exportRunTelemetrySummaryCsv(
                 summary.decodeP50Us,
                 summary.decodeP99Us,
                 summary.decodeJitterUs,
+                summary.decodeCompareP50Us,
+                summary.decodeCompareP99Us,
+                summary.decodeCompareJitterUs,
                 summary.throughputSamplesPerSec,
                 summary.crcBad,
                 summary.lenBad,

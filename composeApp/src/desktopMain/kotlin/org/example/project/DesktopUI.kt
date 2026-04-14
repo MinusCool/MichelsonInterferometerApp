@@ -1105,6 +1105,34 @@ fun DesktopUI() {
         if (sensorMessagesList.size > 300) sensorMessagesList.removeFirst()
     }
 
+    suspend fun warmupDecodePath() {
+        withContext(decodeDispatcher) {
+            val sampleCount = 64
+            val payload = ByteArray(sampleCount * 2)
+
+            repeat(sampleCount) { i ->
+                val v = (i * 17).toShort()
+                payload[i * 2] = (v.toInt() and 0xFF).toByte()
+                payload[i * 2 + 1] = ((v.toInt() ushr 8) and 0xFF).toByte()
+            }
+
+            val tmpBuf1 = ShortRingBuffer(4096)
+            val tmpBuf2 = ShortRingBuffer(4096)
+
+            repeat(3000) {
+                tmpBuf1.clear()
+                tmpBuf2.clear()
+
+                val tmp = decodeInt16LeToShortArray(payload, 0, sampleCount)
+                tmpBuf1.appendAll(tmp)
+
+                tmpBuf2.appendDecodedInt16LeFromByteArrayFast(payload, 0, sampleCount)
+            }
+        }
+
+        appendSensorLog("[WARMUP] decode path warmed up")
+    }
+
     suspend fun synchronizeEspClock(
         sampleCount: Int = 7,
         timeoutPerSampleMs: Long = 2000L,
@@ -1211,6 +1239,8 @@ fun DesktopUI() {
             return false
         }
 
+        warmupDecodePath()
+
         runEpoch.incrementAndGet()
         pythonClient.stop()
         sensorMessagesList.clear()
@@ -1218,13 +1248,32 @@ fun DesktopUI() {
         val repCount = repetitions.toIntOrNull() ?: return false
 
         synchronized(dataLock) {
-            rawBufByChannel.clear()
-            filtBufByChannel.clear()
-            nextSeqToProcess.clear()
+            val repCountLocal = repetitions.toIntOrNull() ?: return false
 
-            for (rep in 1..repCount) {
-                rawBufByChannel[rep] = ShortRingBuffer(rawCap)
-                filtBufByChannel[rep] = DoubleRingBuffer(filtCap)
+            // hapus repetition yang sudah tidak dipakai
+            rawBufByChannel.keys
+                .filter { it !in 1..repCountLocal }
+                .toList()
+                .forEach { rawBufByChannel.remove(it) }
+
+            filtBufByChannel.keys
+                .filter { it !in 1..repCountLocal }
+                .toList()
+                .forEach { filtBufByChannel.remove(it) }
+
+            nextSeqToProcess.keys
+                .filter { it !in 1..repCountLocal }
+                .toList()
+                .forEach { nextSeqToProcess.remove(it) }
+
+            // reuse buffer yang sudah ada; kalau belum ada baru buat
+            for (rep in 1..repCountLocal) {
+                val rawBuf = rawBufByChannel.getOrPut(rep) { ShortRingBuffer(rawCap) }
+                rawBuf.clear()
+
+                val filtBuf = filtBufByChannel.getOrPut(rep) { DoubleRingBuffer(filtCap) }
+                filtBuf.clear()
+
                 nextSeqToProcess[rep] = 0L
             }
 
@@ -1234,7 +1283,6 @@ fun DesktopUI() {
             fftFreqByRep.clear()
             fftSpecByRep.clear()
             telemetryRows.clear()
-
             kalmanXByChannel.clear()
             kalmanPByChannel.clear()
         }
@@ -1512,6 +1560,7 @@ fun DesktopUI() {
             val decodeResult = withContext(decodeDispatcher) {
                 try {
                     val tTotalStartNs = System.nanoTime()
+                    val tCompareStartNs = tTotalStartNs
 
                     val decoded = try {
                         decodePacketForUi(payload, activeRunId)
@@ -1551,6 +1600,7 @@ fun DesktopUI() {
                                 sampleFmt = decoded.sampleFmt,
                                 bytesOnWire = decoded.payloadBytes,
                                 decodeUs = 0.0,
+                                decodeCompareUs = totalUs,
                                 decodeTotalUs = totalUs,
                                 crcOk = decoded.crcOk,
                                 lenOk = decoded.lenOk,
@@ -1634,6 +1684,7 @@ fun DesktopUI() {
                     }
 
                     val bodyUs = elapsedUsSince(tBodyStartNs)
+                    val compareUs = elapsedUsSince(tCompareStartNs)
                     val totalUs = elapsedUsSince(tTotalStartNs)
 
                     if (writtenSamples <= 0) {
@@ -1651,6 +1702,7 @@ fun DesktopUI() {
                                 sampleFmt = decoded.sampleFmt,
                                 bytesOnWire = decoded.payloadBytes,
                                 decodeUs = bodyUs,
+                                decodeCompareUs = compareUs,
                                 decodeTotalUs = totalUs,
                                 crcOk = decoded.crcOk,
                                 lenOk = decoded.lenOk,
@@ -1677,6 +1729,7 @@ fun DesktopUI() {
                             sampleFmt = decoded.sampleFmt,
                             bytesOnWire = decoded.payloadBytes,
                             decodeUs = bodyUs,
+                            decodeCompareUs = compareUs,
                             decodeTotalUs = totalUs,
                             crcOk = decoded.crcOk,
                             lenOk = decoded.lenOk,
