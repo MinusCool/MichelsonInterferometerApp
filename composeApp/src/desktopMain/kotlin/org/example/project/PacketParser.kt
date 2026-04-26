@@ -4,7 +4,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 enum class Variant(val label: String, val code: Int) {
-    TEXT("TEXT", 1),
+    STRING("STRING", 1),
     BIN("BIN", 2),
     BIN_ZC("BIN+ZC", 3),
     UNKNOWN("UNKNOWN", 0)
@@ -14,25 +14,46 @@ object PacketSpec {
     const val MAGIC = 0xB547
     const val VERSION = 1
     const val MSG_TYPE_DATA = 0
-    const val HEADER_LEN = 30
+
+    // Header biner untuk BIN dan BIN+ZC sesuai Tabel 1 proposal.
+    // STRING tidak memakai header fixed-width 38 byte, tetapi membawa field
+    // metadata yang sama dalam bentuk teks.
+    const val HEADER_LEN = 38
+
     const val CHANNEL_COUNT_1 = 1
+
+    // sample_fmt:
+    // 1 = payload int16 little-endian
+    // 2 = payload string ASCII, dipisahkan spasi
     const val SAMPLE_FMT_INT16_LE = 1
+    const val SAMPLE_FMT_STRING_ASCII = 2
+
     const val FLAG_ZEROCOPY_HINT = 0x01
 }
 
 data class TextPacket(
     val runId: Long?,
+    val magic: Int,
+    val version: Int,
+    val msgType: Int,
+    val headerLen: Int,
+    val flags: Int,
     val repId: Int,
     val seq: Long,
     val tSendUs: Long,
     val sampleCount: Int,
     val channelCount: Int,
     val sampleFmt: Int,
+    val payloadBytes: Int,
+    val payloadCrc32: Long,
+    val lenOk: Boolean,
+    val crcOk: Boolean,
     val samples: IntArray
 )
 
 data class BinaryHeader(
     val flags: Int,
+    val runId: Long,
     val repId: Int,
     val seq: Long,
     val tSendUs: Long,
@@ -47,19 +68,34 @@ data class BinaryHeader(
 )
 
 fun detectVariant(payload: ByteArray): Variant {
+    // Format STRING baru:
+    // magic=0xB547|version=1|msg_type=0|header_len=...|...|payload=...
+    if (
+        payload.startsWithPrefix("magic=0xB547|".toByteArray()) ||
+        payload.startsWithPrefix("magic=46407|".toByteArray())
+    ) {
+        return Variant.STRING
+    }
+
+    // Kompatibilitas dengan format STRING lama, jika masih ada log lama.
     if (
         payload.startsWithPrefix("run_id=".toByteArray()) ||
         payload.startsWithPrefix("rep_id=".toByteArray())
     ) {
-        return Variant.TEXT
+        return Variant.STRING
     }
 
+    // Format BIN dan BIN+ZC: header biner diawali magic uint16 little-endian.
     if (payload.size >= 2) {
         val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
         val magic = bb.short.toInt() and 0xFFFF
         if (magic == PacketSpec.MAGIC) {
             val flags = if (payload.size > 6) payload[6].toInt() and 0xFF else 0
-            return if ((flags and PacketSpec.FLAG_ZEROCOPY_HINT) != 0) Variant.BIN_ZC else Variant.BIN
+            return if ((flags and PacketSpec.FLAG_ZEROCOPY_HINT) != 0) {
+                Variant.BIN_ZC
+            } else {
+                Variant.BIN
+            }
         }
     }
 
@@ -68,44 +104,122 @@ fun detectVariant(payload: ByteArray): Variant {
 
 fun parseTextPacket(payload: ByteArray): TextPacket {
     val s = payload.toString(Charsets.UTF_8).trim()
-    val parts = s.split("|")
-    require(parts.size >= 8) { "TEXT: fields kurang" }
 
-    val kv = mutableMapOf<String, String>()
-    for (part in parts.dropLast(1)) {
-        val idx = part.indexOf('=')
-        if (idx > 0) {
-            kv[part.substring(0, idx).trim()] = part.substring(idx + 1).trim()
+    // Format baru wajib punya "|payload=" sebagai batas header teks dan payload sampel.
+    val payloadMarker = "|payload="
+    val payloadMarkerIndex = s.indexOf(payloadMarker)
+
+    if (payloadMarkerIndex >= 0) {
+        val headerText = s.substring(0, payloadMarkerIndex)
+        val sampleText = s.substring(payloadMarkerIndex + payloadMarker.length)
+
+        val kv = parseKeyValueFields(headerText.split("|"))
+
+        val magic = parseMagic(kv["magic"] ?: error("STRING: magic missing"))
+        val version = kv["version"]?.toInt() ?: error("STRING: version missing")
+        val msgType = kv["msg_type"]?.toInt() ?: error("STRING: msg_type missing")
+        val headerLen = kv["header_len"]?.toInt() ?: error("STRING: header_len missing")
+        val flags = kv["flags"]?.toInt() ?: error("STRING: flags missing")
+        val repId = kv["rep_id"]?.toInt() ?: error("STRING: rep_id missing")
+        val seq = kv["seq"]?.toLong() ?: error("STRING: seq missing")
+        val tSendUs = kv["t_send_us"]?.toLong() ?: error("STRING: t_send_us missing")
+        val sampleCount = kv["sample_count"]?.toInt() ?: error("STRING: sample_count missing")
+        val channelCount = kv["channel_count"]?.toInt() ?: error("STRING: channel_count missing")
+        val sampleFmt = kv["sample_fmt"]?.toInt() ?: error("STRING: sample_fmt missing")
+        val payloadBytes = kv["payload_bytes"]?.toInt() ?: error("STRING: payload_bytes missing")
+        val payloadCrc32 = kv["payload_crc32"]?.toLong() ?: error("STRING: payload_crc32 missing")
+        val runId = kv["run_id"]?.toLong()
+
+        require(magic == PacketSpec.MAGIC) { "STRING: bad magic 0x${magic.toString(16)}" }
+        require(version == PacketSpec.VERSION) { "STRING: bad version $version" }
+        require(msgType == PacketSpec.MSG_TYPE_DATA) { "STRING: bad msg_type $msgType" }
+        require(channelCount == PacketSpec.CHANNEL_COUNT_1) { "STRING: unexpected channel_count $channelCount" }
+        require(sampleFmt == PacketSpec.SAMPLE_FMT_STRING_ASCII) { "STRING: unexpected sample_fmt $sampleFmt" }
+
+        val sampleBytes = sampleText.toByteArray(Charsets.UTF_8)
+        val computedHeaderLen = (headerText + payloadMarker).toByteArray(Charsets.UTF_8).size
+
+        val lenOk = (headerLen == computedHeaderLen) && (payloadBytes == sampleBytes.size)
+        val crcOk = crc32Of(sampleBytes, 0, sampleBytes.size) == payloadCrc32
+
+        val samples = sampleText
+            .trim()
+            .split(Regex("\\s+"))
+            .filter { it.isNotBlank() }
+            .map { it.toInt() }
+            .toIntArray()
+
+        require(samples.size == sampleCount * channelCount) {
+            "STRING: sample_count mismatch (${sampleCount * channelCount} != ${samples.size})"
         }
+
+        return TextPacket(
+            runId = runId,
+            magic = magic,
+            version = version,
+            msgType = msgType,
+            headerLen = headerLen,
+            flags = flags,
+            repId = repId,
+            seq = seq,
+            tSendUs = tSendUs,
+            sampleCount = sampleCount,
+            channelCount = channelCount,
+            sampleFmt = sampleFmt,
+            payloadBytes = payloadBytes,
+            payloadCrc32 = payloadCrc32,
+            lenOk = lenOk,
+            crcOk = crcOk,
+            samples = samples
+        )
     }
 
-    val runId = kv["run_id"]?.toLong()
-    val repId = kv["rep_id"]?.toInt() ?: error("TEXT: rep_id missing")
-    val seq = kv["seq"]?.toLong() ?: error("TEXT: seq missing")
-    val tSendUs = kv["t_send_us"]?.toLong() ?: error("TEXT: t_send_us missing")
-    val sampleCount = kv["sample_count"]?.toInt() ?: error("TEXT: sample_count missing")
-    val channelCount = kv["channel_count"]?.toInt() ?: error("TEXT: channel_count missing")
-    val sampleFmt = kv["sample_fmt"]?.toInt() ?: error("TEXT: sample_fmt missing")
+    // Fallback untuk format STRING lama:
+    // run_id=...|rep_id=...|seq=...|...|sample1 sample2 ...
+    val parts = s.split("|")
+    require(parts.size >= 8) { "STRING: fields kurang" }
 
-    val samples = parts.last()
+    val kv = parseKeyValueFields(parts.dropLast(1))
+
+    val runId = kv["run_id"]?.toLong()
+    val repId = kv["rep_id"]?.toInt() ?: error("STRING: rep_id missing")
+    val seq = kv["seq"]?.toLong() ?: error("STRING: seq missing")
+    val tSendUs = kv["t_send_us"]?.toLong() ?: error("STRING: t_send_us missing")
+    val sampleCount = kv["sample_count"]?.toInt() ?: error("STRING: sample_count missing")
+    val channelCount = kv["channel_count"]?.toInt() ?: error("STRING: channel_count missing")
+    val sampleFmt = kv["sample_fmt"]?.toInt() ?: PacketSpec.SAMPLE_FMT_STRING_ASCII
+
+    val sampleText = parts.last()
+    val sampleBytes = sampleText.toByteArray(Charsets.UTF_8)
+
+    val samples = sampleText
         .trim()
         .split(Regex("\\s+"))
         .filter { it.isNotBlank() }
         .map { it.toInt() }
         .toIntArray()
 
-    require(samples.size == sampleCount) {
-        "TEXT: sample_count mismatch ($sampleCount != ${samples.size})"
+    require(samples.size == sampleCount * channelCount) {
+        "STRING: sample_count mismatch (${sampleCount * channelCount} != ${samples.size})"
     }
 
     return TextPacket(
         runId = runId,
+        magic = PacketSpec.MAGIC,
+        version = PacketSpec.VERSION,
+        msgType = PacketSpec.MSG_TYPE_DATA,
+        headerLen = 0,
+        flags = 0,
         repId = repId,
         seq = seq,
         tSendUs = tSendUs,
         sampleCount = sampleCount,
         channelCount = channelCount,
         sampleFmt = sampleFmt,
+        payloadBytes = sampleBytes.size,
+        payloadCrc32 = crc32Of(sampleBytes, 0, sampleBytes.size),
+        lenOk = true,
+        crcOk = true,
         samples = samples
     )
 }
@@ -128,6 +242,7 @@ fun parseBinaryPacketHeader(payload: ByteArray): BinaryHeader {
     val sampleFmt = bb.get().toInt() and 0xFF
     val payloadBytes = bb.short.toInt() and 0xFFFF
     val payloadCrc32 = bb.int.toLong() and 0xFFFFFFFFL
+    val runId = bb.long
 
     require(magic == PacketSpec.MAGIC) { "BIN: bad magic" }
     require(version == PacketSpec.VERSION) { "BIN: bad version $version" }
@@ -144,6 +259,7 @@ fun parseBinaryPacketHeader(payload: ByteArray): BinaryHeader {
 
     return BinaryHeader(
         flags = flags,
+        runId = runId,
         repId = repId,
         seq = seq,
         tSendUs = tSendUs,
@@ -219,6 +335,26 @@ private fun ByteArray.startsWithPrefix(prefix: ByteArray): Boolean {
         if (this[i] != prefix[i]) return false
     }
     return true
+}
+
+private fun parseKeyValueFields(parts: List<String>): Map<String, String> {
+    val kv = mutableMapOf<String, String>()
+    for (part in parts) {
+        val idx = part.indexOf('=')
+        if (idx > 0) {
+            kv[part.substring(0, idx).trim()] = part.substring(idx + 1).trim()
+        }
+    }
+    return kv
+}
+
+private fun parseMagic(value: String): Int {
+    val v = value.trim()
+    return if (v.startsWith("0x", ignoreCase = true)) {
+        v.substring(2).toInt(16)
+    } else {
+        v.toInt()
+    }
 }
 
 fun decodeInt16LeIntoShortArray(

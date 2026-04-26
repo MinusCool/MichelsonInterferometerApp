@@ -252,7 +252,7 @@ private fun VariantChipGroup(selected: Int, onSelect: (Int) -> Unit) {
     ) {
         listOf(1, 2, 3).forEach { code ->
             val label = when (code) {
-                1 -> "TEXT"
+                1 -> "STRING"
                 2 -> "BIN"
                 else -> "BIN+ZC"
             }
@@ -282,6 +282,7 @@ private fun VariantChipGroup(selected: Int, onSelect: (Int) -> Unit) {
 }
 
 private data class UiDecodedPacket(
+    val runId: Long?,
     val repId: Int,
     val variant: Variant,
     val samples: ShortArray?,
@@ -354,11 +355,14 @@ private fun decodePacketForUi(
     activeRunId: Long?
 ): UiDecodedPacket? {
     return when (val variant = detectVariant(payload)) {
-        Variant.TEXT -> {
+        Variant.STRING -> {
             val p = parseTextPacket(payload)
             if (p.runId != null && activeRunId != null && p.runId != activeRunId) return null
 
+            val accepted = p.lenOk && p.crcOk
+
             UiDecodedPacket(
+                runId = p.runId,
                 repId = p.repId,
                 variant = variant,
                 samples = ShortArray(p.samples.size) { i -> p.samples[i].toShort() },
@@ -368,18 +372,21 @@ private fun decodePacketForUi(
                 channelCount = p.channelCount,
                 sampleFmt = p.sampleFmt,
                 payloadBytes = payload.size,
-                crcOk = null,
-                lenOk = true,
-                accepted = true,
+                crcOk = p.crcOk,
+                lenOk = p.lenOk,
+                accepted = accepted,
                 payloadOffset = null
             )
         }
 
         Variant.BIN -> {
             val h = parseBinaryPacketHeader(payload)
+            if (activeRunId != null && h.runId != activeRunId) return null
+
             val accepted = h.lenOk && h.crcOk
 
             UiDecodedPacket(
+                runId = h.runId,
                 repId = h.repId,
                 variant = variant,
                 samples = null,
@@ -398,9 +405,12 @@ private fun decodePacketForUi(
 
         Variant.BIN_ZC -> {
             val h = parseBinaryPacketHeader(payload)
+            if (activeRunId != null && h.runId != activeRunId) return null
+
             val accepted = h.lenOk && h.crcOk
 
             UiDecodedPacket(
+                runId = h.runId,
                 repId = h.repId,
                 variant = variant,
                 samples = null,
@@ -432,16 +442,19 @@ private fun extractRunIdFromControlMessage(message: String): Long? {
 
 private fun buildAutoQueue(runsPerVariant: Int, orderMode: String): List<Int> {
     if (runsPerVariant <= 0) return emptyList()
+
     return if (orderMode == "interleaved") {
         buildList {
             repeat(runsPerVariant) {
-                add(1)
-                add(2)
-                add(3)
+                add(1) // STRING
+                add(2) // BIN
+                add(3) // BIN+ZC
             }
         }
     } else {
-        List(runsPerVariant) { 1 } + List(runsPerVariant) { 2 } + List(runsPerVariant) { 3 }
+        List(runsPerVariant) { 1 } +
+                List(runsPerVariant) { 2 } +
+                List(runsPerVariant) { 3 }
     }
 }
 
@@ -946,7 +959,7 @@ private fun materializeBodyOutsideLock(
     payload: ByteArray
 ): ShortArray? {
     return when (decoded.variant) {
-        Variant.TEXT -> decoded.samples ?: ShortArray(0)
+        Variant.STRING -> decoded.samples ?: ShortArray(0)
 
         Variant.BIN -> {
             val payloadOffset = decoded.payloadOffset ?: return ShortArray(0)
@@ -971,7 +984,7 @@ private fun writeDecodedPacketToBuffer(
     predecodedSamples: ShortArray
 ): Int {
     return when (decoded.variant) {
-        Variant.TEXT,
+        Variant.STRING,
         Variant.BIN -> {
             if (predecodedSamples.isEmpty()) 0 else buf.appendAll(predecodedSamples)
         }
@@ -1105,6 +1118,13 @@ fun DesktopUI() {
         if (sensorMessagesList.size > 300) sensorMessagesList.removeFirst()
     }
 
+    fun drainMqttQueue() {
+        while (true) {
+            val result = mqttQueue.tryReceive()
+            if (result.isFailure) break
+        }
+    }
+
     suspend fun warmupDecodePath() {
         withContext(decodeDispatcher) {
             val sampleCount = 64
@@ -1134,9 +1154,9 @@ fun DesktopUI() {
     }
 
     suspend fun synchronizeEspClock(
-        sampleCount: Int = 7,
-        timeoutPerSampleMs: Long = 2000L,
-        interSampleDelayMs: Long = 40L
+        sampleCount: Int = 5,
+        timeoutPerSampleMs: Long = 1500L,
+        interSampleDelayMs: Long = 25L
     ): Boolean {
         if (!connected) {
             dialogInfo = UiDialogInfo(
@@ -1185,9 +1205,8 @@ fun DesktopUI() {
             return false
         }
 
-        // Urutkan dari RTT terbaik, lalu ambil maksimal 3 terbaik dan median offset-nya
         val ranked = samples.sortedBy { it.rttUs }
-        val best = ranked.take(minOf(3, ranked.size))
+        val best = ranked.take(minOf(5, ranked.size))
         val offsets = best.map { it.espMinusPcOffsetUs }.sorted()
 
         val medianOffset = when (offsets.size) {
@@ -1240,6 +1259,12 @@ fun DesktopUI() {
         }
 
         warmupDecodePath()
+        delay(200L)
+
+        // Bersihkan sisa frame lama sebelum run baru dimulai
+        drainMqttQueue()
+        delay(250L)
+        drainMqttQueue()
 
         runEpoch.incrementAndGet()
         pythonClient.stop()
@@ -1297,6 +1322,7 @@ fun DesktopUI() {
         donePending = false
         doneSeenAtMs = null
         lastDataAtMs = null
+        drainMqttQueue()
 
         uiTick++
         procTick++
@@ -1560,7 +1586,15 @@ fun DesktopUI() {
             val decodeResult = withContext(decodeDispatcher) {
                 try {
                     val tTotalStartNs = System.nanoTime()
-                    val tCompareStartNs = tTotalStartNs
+
+                    // Fair decode timing for all variants:
+                    // STRING -> parse textual metadata + parse textual samples + store
+                    // BIN    -> parse/validate binary header + decode payload + store
+                    // BIN_ZC -> parse/validate binary header + direct decode-to-buffer
+                    //
+                    // Dengan boundary ini, decodeUs menjadi apple-to-apple
+                    // untuk STRING, BIN, dan BIN+ZC.
+                    val tDecodeStartNs = tTotalStartNs
 
                     val decoded = try {
                         decodePacketForUi(payload, activeRunId)
@@ -1573,7 +1607,7 @@ fun DesktopUI() {
 
                     if (decoded == null) {
                         val preview = when (detectVariant(payload)) {
-                            Variant.TEXT -> textPreview(payload)
+                            Variant.STRING -> textPreview(payload)
                             Variant.BIN, Variant.BIN_ZC -> hexPreview(payload)
                             Variant.UNKNOWN -> hexPreview(payload)
                         }
@@ -1589,6 +1623,7 @@ fun DesktopUI() {
                         synchronized(dataLock) {
                             telemetryRows += PacketTelemetryRecord(
                                 variant = decoded.variant.code,
+                                runId = decoded.runId,
                                 repId = decoded.repId,
                                 seq = decoded.seq,
                                 tSendUs = decoded.tSendUs,
@@ -1622,11 +1657,9 @@ fun DesktopUI() {
                         wroteSamples = false
                     )
 
-                    val tBodyStartNs = System.nanoTime()
-
                     val predecodedSamples = try {
                         when (decoded.variant) {
-                            Variant.TEXT, Variant.BIN -> materializeBodyOutsideLock(decoded, payload)
+                            Variant.STRING, Variant.BIN -> materializeBodyOutsideLock(decoded, payload)
                             Variant.BIN_ZC, Variant.UNKNOWN -> null
                         }
                     } catch (e: Exception) {
@@ -1640,7 +1673,7 @@ fun DesktopUI() {
 
                     val writtenSamples: Int = try {
                         when (decoded.variant) {
-                            Variant.TEXT, Variant.BIN -> {
+                            Variant.STRING, Variant.BIN -> {
                                 val samples = predecodedSamples ?: ShortArray(0)
                                 if (benchmarkExclusive) {
                                     writeDecodedPacketToBuffer(decoded, rawBuf, samples)
@@ -1683,14 +1716,17 @@ fun DesktopUI() {
                         )
                     }
 
-                    val bodyUs = elapsedUsSince(tBodyStartNs)
-                    val compareUs = elapsedUsSince(tCompareStartNs)
+                    val bodyUs = elapsedUsSince(tDecodeStartNs)
+                    // decodeCompareUs dipertahankan untuk kompatibilitas CSV / summary lama.
+                    // Setelah boundary disamakan, nilainya identik dengan decodeUs.
+                    val compareUs = bodyUs
                     val totalUs = elapsedUsSince(tTotalStartNs)
 
                     if (writtenSamples <= 0) {
                         synchronized(dataLock) {
                             telemetryRows += PacketTelemetryRecord(
                                 variant = decoded.variant.code,
+                                runId = decoded.runId,
                                 repId = decoded.repId,
                                 seq = decoded.seq,
                                 tSendUs = decoded.tSendUs,
@@ -1718,6 +1754,7 @@ fun DesktopUI() {
                     synchronized(dataLock) {
                         telemetryRows += PacketTelemetryRecord(
                             variant = decoded.variant.code,
+                            runId = decoded.runId,
                             repId = decoded.repId,
                             seq = decoded.seq,
                             tSendUs = decoded.tSendUs,

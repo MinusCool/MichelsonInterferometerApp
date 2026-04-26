@@ -7,7 +7,8 @@ import kotlin.math.ceil
 import kotlin.math.floor
 
 data class PacketTelemetryRecord(
-    val variant: Int,              // 1=text, 2=binary, 3=binary+zc
+    val variant: Int,              // 1=string, 2=binary, 3=binary+zc
+    val runId: Long? = null,       // BARU: identitas run untuk cegah kontaminasi lintas-run
     val repId: Int,
     val seq: Long,
     val tSendUs: Long,
@@ -24,7 +25,7 @@ data class PacketTelemetryRecord(
     val decodeUs: Double,
 
     // Baru: parse + body decode + store
-    // dipakai untuk perbandingan adil TEXT vs BIN vs BIN+ZC
+    // dipakai untuk perbandingan adil STRING vs BIN vs BIN+ZC
     val decodeCompareUs: Double? = null,
 
     // Total: parse + validate + crc + body decode + store + bookkeeping minimum
@@ -115,6 +116,11 @@ data class RunTelemetrySummary(
     val repetitionCount: Int
 )
 
+private data class RunRepKey(
+    val runId: Long?,
+    val repId: Int
+)
+
 private fun percentile(xs: List<Double>, p: Double): Double {
     val clean = xs.filter { it.isFinite() }
     if (clean.isEmpty()) return Double.NaN
@@ -188,9 +194,16 @@ fun buildPerRepTelemetrySummaries(records: List<PacketTelemetryRecord>): List<Re
     if (records.isEmpty()) return emptyList()
 
     return records
-        .groupBy { it.repId }
-        .toSortedMap()
-        .map { (repId, repRecords) ->
+        .groupBy { RunRepKey(runId = it.runId, repId = it.repId) }
+        .toList()
+        .sortedWith(
+            compareBy<Pair<RunRepKey, List<PacketTelemetryRecord>>>(
+                { it.first.runId ?: Long.MIN_VALUE },
+                { it.first.repId }
+            )
+        )
+        .map { (key, repRecords) ->
+            val repId = key.repId
             val packetList = repRecords.sortedBy { it.tRecvMonoUs }
             val variant = packetList.firstOrNull()?.variant ?: 0
             val validPackets = packetList.filter { it.accepted && it.writtenSamples > 0 }
@@ -244,9 +257,6 @@ fun buildPerRepTelemetrySummaries(records: List<PacketTelemetryRecord>): List<Re
 
             val totalSamples = validPackets.sumOf { it.writtenSamples.toLong() }
 
-            // R = N_samples / T
-            // T dipakai sebagai durasi aktif pengiriman pada sisi sender
-            // berdasarkan rentang timestamp t_send_us paket valid.
             val dtSec = durationSecFromSenderTimestamps(validPackets)
             val throughput = if (dtSec > 0.0) totalSamples / dtSec else 0.0
 
@@ -399,13 +409,14 @@ fun exportPacketTelemetryCsv(records: List<PacketTelemetryRecord>): File {
     val file = File(experimentsDir(), "packet_telemetry_${timestampLabel()}.csv")
     file.bufferedWriter().use { w ->
         w.appendLine(
-            "variant,rep_id,seq,t_send_us,t_recv_epoch_us,t_recv_mono_us,esp_minus_pc_offset_us," +
+            "variant,run_id,rep_id,seq,t_send_us,t_recv_epoch_us,t_recv_mono_us,esp_minus_pc_offset_us," +
                     "sample_count,channel_count,sample_fmt,bytes_on_wire,decode_us,decode_compare_us,decode_total_us,crc_ok,len_ok,accepted,written_samples"
         )
         records.forEach { r ->
             w.appendLine(
                 listOf(
                     r.variant,
+                    r.runId?.toString() ?: "",
                     r.repId,
                     r.seq,
                     r.tSendUs,
