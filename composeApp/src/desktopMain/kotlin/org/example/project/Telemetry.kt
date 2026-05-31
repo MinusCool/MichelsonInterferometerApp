@@ -116,6 +116,45 @@ data class RunTelemetrySummary(
     val repetitionCount: Int
 )
 
+data class SystemTestTelemetryRecord(
+    val runId: Long?,
+    val variant: Int,
+    val speed: Int,
+    val repetitions: Int,
+    val ringBufferCapacity: Int,
+    val snapshotIntervalMs: Long,
+
+    val startedAtEpochMs: Long,
+    val endedAtEpochMs: Long,
+    val durationMs: Long,
+
+    val totalWrittenSamples: Long,
+    val circularOverwriteSamples: Long,
+    val circularOverwriteEvents: Long,
+    val circularOverwriteDetected: Boolean,
+
+    val processingDroppedSamples: Long,
+    val processingOverrunEvents: Long,
+    val processingOverrunDetected: Boolean,
+    val processingBacklogMaxSamples: Long,
+
+    val snapshotCount: Long,
+    val snapshotLateEvents: Long,
+    val snapshotDroppedSamples: Long,
+    val snapshotOverrunEvents: Long,
+    val snapshotLateDetected: Boolean,
+    val snapshotMaxDurationMs: Double,
+    val snapshotAvgDurationMs: Double,
+
+    val decodeQueueMaxDepth: Int,
+    val decodeQueueWaitP50Us: Double,
+    val decodeQueueWaitP99Us: Double,
+    val decodeQueueWaitMaxUs: Long,
+
+    val systemSafe: Boolean,
+    val note: String
+)
+
 private data class RunRepKey(
     val runId: Long?,
     val repId: Int
@@ -509,5 +548,58 @@ fun exportRunTelemetrySummaryCsv(
             ).joinToString(",")
         )
     }
+    return file
+}
+
+fun exportSystemTestTelemetryCsv(record: SystemTestTelemetryRecord): File {
+    val file = File(experimentsDir(), "system_test_telemetry_${timestampLabel()}.csv")
+
+    file.bufferedWriter().use { w ->
+        w.appendLine(
+            "run_id,variant,speed,repetitions,ring_buffer_capacity,snapshot_interval_ms," +
+                    "started_at_epoch_ms,ended_at_epoch_ms,duration_ms," +
+                    "total_written_samples,circular_overwrite_samples,circular_overwrite_events,circular_overwrite_detected," +
+                    "processing_dropped_samples,processing_overrun_events,processing_overrun_detected,processing_backlog_max_samples," +
+                    "snapshot_count,snapshot_late_events,snapshot_dropped_samples,snapshot_overrun_events,snapshot_late_detected,snapshot_max_duration_ms,snapshot_avg_duration_ms," +
+                    "decode_queue_max_depth,decode_queue_wait_p50_us,decode_queue_wait_p99_us,decode_queue_wait_max_us," +
+                    "system_safe,note"
+        )
+
+        w.appendLine(
+            listOf(
+                record.runId?.toString() ?: "",
+                record.variant,
+                record.speed,
+                record.repetitions,
+                record.ringBufferCapacity,
+                record.snapshotIntervalMs,
+                record.startedAtEpochMs,
+                record.endedAtEpochMs,
+                record.durationMs,
+                record.totalWrittenSamples,
+                record.circularOverwriteSamples,
+                record.circularOverwriteEvents,
+                record.circularOverwriteDetected,
+                record.processingDroppedSamples,
+                record.processingOverrunEvents,
+                record.processingOverrunDetected,
+                record.processingBacklogMaxSamples,
+                record.snapshotCount,
+                record.snapshotLateEvents,
+                record.snapshotDroppedSamples,
+                record.snapshotOverrunEvents,
+                record.snapshotLateDetected,
+                record.snapshotMaxDurationMs,
+                record.snapshotAvgDurationMs,
+                record.decodeQueueMaxDepth,
+                record.decodeQueueWaitP50Us,
+                record.decodeQueueWaitP99Us,
+                record.decodeQueueWaitMaxUs,
+                record.systemSafe,
+                record.note.replace(",", ";")
+            ).joinToString(",")
+        )
+    }
+
     return file
 }
