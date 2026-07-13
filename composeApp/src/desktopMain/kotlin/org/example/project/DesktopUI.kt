@@ -243,7 +243,7 @@ private fun VariantChipGroup(selected: Int, onSelect: (Int) -> Unit) {
     ) {
         listOf(1, 2, 3).forEach { code ->
             val label = when (code) {
-                1 -> "STRING"
+                1 -> "BASELINE"
                 2 -> "BIN"
                 else -> "BIN+ZC"
             }
@@ -262,14 +262,6 @@ private fun VariantChipGroup(selected: Int, onSelect: (Int) -> Unit) {
                 border = ButtonDefaults.outlinedButtonBorder,
                 shape = RoundedCornerShape(16.dp)
             ) {
-                if (selected == code) {
-                    Icon(
-                        Icons.Default.Check,
-                        contentDescription = "Selected",
-                        modifier = Modifier.size(14.dp)
-                    )
-                    Spacer(Modifier.width(4.dp))
-                }
                 Text(label, fontWeight = FontWeight.SemiBold, fontSize = 11.sp)
             }
         }
@@ -745,12 +737,12 @@ private fun KotlinSignalPlotSection(
 
         Text(
             "Signal Plot - Repetition $channel  •  sample ${window.start}..${window.endExclusive - 1}  •  min=${
-            minValue?.let {
-                "%.3f".format(
-                    it
-                )
-            } ?: "-"
-        }  •  max=${maxValue?.let { "%.3f".format(it) } ?: "-"}",
+                minValue?.let {
+                    "%.3f".format(
+                        it
+                    )
+                } ?: "-"
+            }  •  max=${maxValue?.let { "%.3f".format(it) } ?: "-"}",
             fontSize = 12.sp,
             color = PremiumTokens.TextMuted)
 
@@ -1156,7 +1148,7 @@ fun DesktopUI() {
     // mencari ukuran minimum ring buffer pada beban terberat baseline/string speed 3.
     var ringBufferOverrunWarning by remember { mutableStateOf("") }
 
-    var ringBufferCapacityText by remember { mutableStateOf("512") }
+    var ringBufferCapacityText by remember { mutableStateOf("") }
 
     val rawCap = parseRingBufferCapacity(ringBufferCapacityText)
     val filtCap = rawCap
@@ -1171,9 +1163,6 @@ fun DesktopUI() {
     val fftZeroPadFactor = 8
     val fftUseAutoBand = true
 
-    // Harus false supaya snapshot periodik UI aman membaca buffer
-    // ketika decode thread sedang menulis. Jika true, decode menulis tanpa lock.
-    val isolateDecodeBenchmarkDuringRun = false
 
     val rawBufByChannel = remember { mutableMapOf<Int, ShortRingBuffer>() }
     val filtBufByChannel = remember { mutableMapOf<Int, DoubleRingBuffer>() }
@@ -1203,10 +1192,10 @@ fun DesktopUI() {
     var doneSeenAtMs by remember { mutableStateOf<Long?>(null) }
     var lastDataAtMs by remember { mutableStateOf<Long?>(null) }
 
-    var autoRunsPerVariant by remember { mutableStateOf("10") }
-    var autoOrderMode by remember { mutableStateOf("interleaved") } // interleaved / grouped
+    var autoRunsPerVariant by remember { mutableStateOf("") }
+    var autoOrderMode by remember { mutableStateOf("interleaved") }
     var autoDelayMsText by remember { mutableStateOf("1000") }
-    var uiSnapshotIntervalMsText by remember { mutableStateOf("100") }
+    var uiSnapshotIntervalMsText by remember { mutableStateOf("") }
     var rawPlotSnapshot by remember { mutableStateOf<Map<Int, List<Int>>>(emptyMap()) }
     var filteredPlotSnapshot by remember { mutableStateOf<Map<Int, List<Double>>>(emptyMap()) }
     var fftFreqPlotSnapshot by remember { mutableStateOf<Map<Int, DoubleArray>>(emptyMap()) }
@@ -2005,14 +1994,15 @@ fun DesktopUI() {
                 try {
                     val tTotalStartNs = System.nanoTime()
 
-                    // Fair decode timing for all variants:
-                    // STRING -> parse textual metadata + parse textual samples + store
-                    // BIN    -> parse/validate binary header + decode payload + store
-                    // BIN_ZC -> parse/validate binary header + direct decode-to-buffer
-                    //
-                    // Dengan boundary ini, decodeUs menjadi apple-to-apple
-                    // untuk STRING, BIN, dan BIN+ZC.
-                    val tDecodeStartNs = tTotalStartNs
+                    // Boundary timing:
+                    // decodeUs       = body decode + store ke ring buffer.
+                    //                  Untuk STRING, parsing teks sampel ikut dihitung
+                    //                  karena parsing teks adalah body decoding baseline.
+                    //                  Untuk BIN dan BIN+ZC, header parse/CRC tidak ikut
+                    //                  karena sama-sama fixed-width binary dan bukan bagian
+                    //                  dari perbedaan utama temporary-buffer vs zero-copy.
+                    // decodeCompareUs = parse/validate + body decode + store.
+                    // decodeTotalUs   = total jalur decode sampai telemetry siap dicatat.
 
                     val decoded = try {
                         decodePacketForUi(payload, activeRunId)
@@ -2074,6 +2064,16 @@ fun DesktopUI() {
                         wroteSamples = false
                     )
 
+                    val tBodyStartNs = when (decoded.variant) {
+                        // STRING: body decoding sudah terjadi di parseTextPacket(),
+                        // sehingga timer body harus dimulai dari awal decode packet.
+                        Variant.STRING -> tTotalStartNs
+
+                        // BIN dan BIN+ZC: header parse + CRC sama-sama binary,
+                        // sehingga C2 lebih adil jika mengukur payload decode + store saja.
+                        Variant.BIN, Variant.BIN_ZC, Variant.UNKNOWN -> System.nanoTime()
+                    }
+
                     val predecodedSamples = try {
                         when (decoded.variant) {
                             Variant.STRING, Variant.BIN -> {
@@ -2089,8 +2089,6 @@ fun DesktopUI() {
                             logMessage = "[BODY PREP ERROR] ${e.message}", wroteSamples = false
                         )
                     }
-
-                    val benchmarkExclusive = isolateDecodeBenchmarkDuringRun && runInProgress
 
                     val writtenSamples: Int = try {
                         when (decoded.variant) {
@@ -2128,11 +2126,9 @@ fun DesktopUI() {
                         )
                     }
 
-                    val bodyUs = elapsedUsSince(tDecodeStartNs)
-                    // decodeCompareUs dipertahankan untuk kompatibilitas CSV / summary lama.
-                    // Setelah boundary disamakan, nilainya identik dengan decodeUs.
-                    val compareUs = bodyUs
+                    val bodyUs = elapsedUsSince(tBodyStartNs)
                     val totalUs = elapsedUsSince(tTotalStartNs)
+                    val compareUs = totalUs
 
                     if (writtenSamples <= 0) {
                         synchronized(dataLock) {
@@ -2591,49 +2587,49 @@ fun DesktopUI() {
                                     modifier = Modifier.fillMaxWidth()
                                 )
 
-                                Spacer(Modifier.height(8.dp))
+//                                Spacer(Modifier.height(8.dp))
+//
+//                                Text("Order", color = PremiumTokens.TextMuted, fontSize = 12.sp)
+//                                Spacer(Modifier.height(6.dp))
+//                                Row(
+//                                    modifier = Modifier.fillMaxWidth(),
+//                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+//                                ) {
+//                                    Button(
+//                                        onClick = { autoOrderMode = "interleaved" },
+//                                        modifier = Modifier.weight(1f),
+//                                        colors = ButtonDefaults.buttonColors(
+//                                            containerColor = if (autoOrderMode == "interleaved") PremiumTokens.Primary else PremiumTokens.Surface,
+//                                            contentColor = if (autoOrderMode == "interleaved") Color.White else PremiumTokens.Text
+//                                        )
+//                                    ) {
+//                                        Text("Interleaved", fontSize = 11.sp)
+//                                    }
+//                                    Button(
+//                                        onClick = { autoOrderMode = "grouped" },
+//                                        modifier = Modifier.weight(1f),
+//                                        colors = ButtonDefaults.buttonColors(
+//                                            containerColor = if (autoOrderMode == "grouped") PremiumTokens.Primary else PremiumTokens.Surface,
+//                                            contentColor = if (autoOrderMode == "grouped") Color.White else PremiumTokens.Text
+//                                        )
+//                                    ) {
+//                                        Text("Grouped", fontSize = 11.sp)
+//                                    }
+//                                }
 
-                                Text("Order", color = PremiumTokens.TextMuted, fontSize = 12.sp)
-                                Spacer(Modifier.height(6.dp))
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    Button(
-                                        onClick = { autoOrderMode = "interleaved" },
-                                        modifier = Modifier.weight(1f),
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = if (autoOrderMode == "interleaved") PremiumTokens.Primary else PremiumTokens.Surface,
-                                            contentColor = if (autoOrderMode == "interleaved") Color.White else PremiumTokens.Text
-                                        )
-                                    ) {
-                                        Text("Interleaved", fontSize = 11.sp)
-                                    }
-                                    Button(
-                                        onClick = { autoOrderMode = "grouped" },
-                                        modifier = Modifier.weight(1f),
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = if (autoOrderMode == "grouped") PremiumTokens.Primary else PremiumTokens.Surface,
-                                            contentColor = if (autoOrderMode == "grouped") Color.White else PremiumTokens.Text
-                                        )
-                                    ) {
-                                        Text("Grouped", fontSize = 11.sp)
-                                    }
-                                }
-
-                                Spacer(Modifier.height(8.dp))
-
-                                OutlinedTextField(
-                                    value = autoDelayMsText,
-                                    onValueChange = {
-                                        if (it.isEmpty() || it.all(Char::isDigit)) autoDelayMsText =
-                                            it
-                                    },
-                                    label = { Text("Delay between runs (ms)") },
-                                    singleLine = true,
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                    modifier = Modifier.fillMaxWidth()
-                                )
+//                                Spacer(Modifier.height(8.dp))
+//
+//                                OutlinedTextField(
+//                                    value = autoDelayMsText,
+//                                    onValueChange = {
+//                                        if (it.isEmpty() || it.all(Char::isDigit)) autoDelayMsText =
+//                                            it
+//                                    },
+//                                    label = { Text("Delay between runs (ms)") },
+//                                    singleLine = true,
+//                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+//                                    modifier = Modifier.fillMaxWidth()
+//                                )
 
                                 Spacer(Modifier.height(8.dp))
 
@@ -2645,9 +2641,6 @@ fun DesktopUI() {
                                         }
                                     },
                                     label = { Text("UI snapshot interval (ms)") },
-                                    supportingText = {
-                                        Text("Interval snapshot periodik dari ring buffer saat benchmark.")
-                                    },
                                     singleLine = true,
                                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                     modifier = Modifier.fillMaxWidth(),
@@ -2672,10 +2665,7 @@ fun DesktopUI() {
                                             ringBufferCapacityText = it
                                         }
                                     },
-                                    label = { Text("Ring buffer capacity (samples/rep)") },
-                                    supportingText = {
-                                        Text("Untuk mencari kapasitas minimum baseline speed 3. Circular overwrite boleh, processing overrun tidak boleh.")
-                                    },
+                                    label = { Text("Ring buffer capacity") },
                                     singleLine = true,
                                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                     modifier = Modifier.fillMaxWidth(),
@@ -2707,12 +2697,6 @@ fun DesktopUI() {
 
                                 Spacer(Modifier.height(8.dp))
 
-                                Text(
-                                    "Pretest minimum buffer: gunakan Variant=Baseline/String, Speed=3, lalu turunkan capacity dan ubah snapshot interval sampai ditemukan batas aman sebelum overrun.",
-                                    color = PremiumTokens.TextMuted,
-                                    fontSize = 12.sp
-                                )
-
                                 if (ringBufferOverrunWarning.isNotBlank()) {
                                     Spacer(Modifier.height(8.dp))
 
@@ -2725,6 +2709,8 @@ fun DesktopUI() {
                                 }
 
                                 Spacer(Modifier.height(10.dp))
+                                Text("Acquisition Parameters", color = PremiumTokens.Text, fontWeight = FontWeight.SemiBold)
+                                Spacer(Modifier.height(8.dp))
                                 OutlinedTextField(
                                     value = angle,
                                     onValueChange = { newValue ->
@@ -2758,7 +2744,7 @@ fun DesktopUI() {
                                             "Nilai Speed harus berupa angka yang valid. Periksa kembali input Anda."
                                         )
                                     },
-                                    label = { Text("Speed") },
+                                    label = { Text("Speed (acquisition duration, s)") },
                                     modifier = Modifier.fillMaxWidth(),
                                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                     colors = OutlinedTextFieldDefaults.colors(
@@ -2950,8 +2936,8 @@ fun DesktopUI() {
                                                     Spacer(Modifier.height(4.dp))
                                                     Text(
                                                         "Dominant freq: ${
-                                                        freq?.roundToInt()?.let { "$it Hz" } ?: "-"
-                                                    }",
+                                                            freq?.roundToInt()?.let { "$it Hz" } ?: "-"
+                                                        }",
                                                         color = PremiumTokens.TextMuted,
                                                         fontSize = 12.sp)
                                                 }

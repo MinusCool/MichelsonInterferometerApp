@@ -155,6 +155,59 @@ data class SystemTestTelemetryRecord(
     val note: String
 )
 
+data class BufferSnapshotConfigRecord(
+    val runId: Long?,
+    val isReference: Boolean,
+    val variant: Int,
+    val speed: Int,
+    val repetitions: Int,
+    val ringBufferCapacity: Int,
+    val snapshotIntervalMs: Long,
+
+    val startedAtEpochMs: Long,
+    val endedAtEpochMs: Long,
+    val durationMs: Long,
+
+    val packets: Int,
+    val totalSamples: Long,
+    val avgBytesOnWire: Double,
+    val lossRateQ: Double,
+    val throughputSamplesPerSec: Double,
+    val crcBad: Int,
+    val lenBad: Int,
+
+    val totalWrittenSamples: Long,
+    val circularOverwriteSamples: Long,
+    val circularOverwriteEvents: Long,
+    val circularOverwriteDetected: Boolean,
+
+    val processingDroppedSamples: Long,
+    val processingOverrunEvents: Long,
+    val processingOverrunDetected: Boolean,
+    val processingBacklogMaxSamples: Long,
+
+    val snapshotCount: Long,
+    val snapshotLateEvents: Long,
+    val snapshotDroppedSamples: Long,
+    val snapshotOverrunEvents: Long,
+    val snapshotLateDetected: Boolean,
+    val snapshotMaxDurationMs: Double,
+    val snapshotAvgDurationMs: Double,
+
+    val decodeQueueMaxDepth: Int,
+    val decodeQueueWaitP50Us: Double,
+    val decodeQueueWaitP99Us: Double,
+    val decodeQueueWaitMaxUs: Long,
+
+    val qReference: Double?,
+    val throughputReferenceSamplesPerSec: Double?,
+    val qNotIncreased: Boolean,
+    val throughputNotDecreased: Boolean,
+
+    val systemSafe: Boolean,
+    val proposalCriteriaPassed: Boolean,
+    val note: String
+)
 private data class RunRepKey(
     val runId: Long?,
     val repId: Int
@@ -192,26 +245,17 @@ private fun packetLatencyUs(packet: PacketTelemetryRecord): Double {
     return packet.tRecvMonoUs.toDouble() - packet.tSendUs.toDouble() + theta
 }
 
-private fun durationSecFromSenderTimestamps(validPackets: List<PacketTelemetryRecord>): Double {
+private fun durationSecFromValidPackets(validPackets: List<PacketTelemetryRecord>): Double {
     if (validPackets.isEmpty()) return 0.0
     if (validPackets.size == 1) return 1e-6
 
-    val sendSorted = validPackets.sortedBy { it.tSendUs }
-    val first = sendSorted.first().tSendUs.toDouble()
-    val last = sendSorted.last().tSendUs.toDouble()
+    val recvSorted = validPackets.sortedBy { it.tRecvMonoUs }
+    val first = recvSorted.first().tRecvMonoUs.toDouble()
+    val last = recvSorted.last().tRecvMonoUs.toDouble()
 
     val dtUs = last - first
     return maxOf(1e-6, dtUs / 1_000_000.0)
 }
-
-//private fun durationSecFromValidPackets(validPackets: List<PacketTelemetryRecord>): Double {
-//    if (validPackets.isEmpty()) return 0.0
-//    if (validPackets.size == 1) return 1e-6
-//
-//    val recvSorted = validPackets.sortedBy { it.tRecvMonoUs }
-//    val dtUs = (recvSorted.last().tRecvMonoUs - recvSorted.first().tRecvMonoUs).toDouble()
-//    return maxOf(1e-6, dtUs / 1_000_000.0)
-//}
 
 private fun gapRateFromReceiveOrder(packetList: List<PacketTelemetryRecord>): Double {
     if (packetList.isEmpty()) return Double.NaN
@@ -296,7 +340,7 @@ fun buildPerRepTelemetrySummaries(records: List<PacketTelemetryRecord>): List<Re
 
             val totalSamples = validPackets.sumOf { it.writtenSamples.toLong() }
 
-            val dtSec = durationSecFromSenderTimestamps(validPackets)
+            val dtSec = durationSecFromValidPackets(validPackets)
             val throughput = if (dtSec > 0.0) totalSamples / dtSec else 0.0
 
             RepTelemetrySummary(
@@ -398,7 +442,7 @@ fun buildRunTelemetrySummary(records: List<PacketTelemetryRecord>): RunTelemetry
     val decodeCompare = validPackets.mapNotNull { it.decodeCompareUs }
     val totalSamples = validPackets.sumOf { it.writtenSamples.toLong() }
 
-    val dtSec = durationSecFromSenderTimestamps(validPackets)
+    val dtSec = durationSecFromValidPackets(validPackets)
     val throughput = if (dtSec > 0.0) totalSamples / dtSec else 0.0
 
     val p50L = percentile(latencies, 50.0)
@@ -596,6 +640,86 @@ fun exportSystemTestTelemetryCsv(record: SystemTestTelemetryRecord): File {
                 record.decodeQueueWaitP99Us,
                 record.decodeQueueWaitMaxUs,
                 record.systemSafe,
+                record.note.replace(",", ";")
+            ).joinToString(",")
+        )
+    }
+
+    return file
+}
+
+fun exportBufferSnapshotConfigCsv(record: BufferSnapshotConfigRecord): File {
+    val file = File(experimentsDir(), "buffer_snapshot_config_test.csv")
+    val writeHeader = !file.exists() || file.length() == 0L
+
+    java.io.FileWriter(file, true).buffered().use { w ->
+        if (writeHeader) {
+            w.appendLine(
+                "run_id,is_reference,variant,speed,repetitions,ring_buffer_capacity,snapshot_interval_ms," +
+                        "started_at_epoch_ms,ended_at_epoch_ms,duration_ms," +
+                        "packets,total_samples,avg_bytes_on_wire,loss_rate_q,throughput_samples_per_sec,crc_bad,len_bad," +
+                        "total_written_samples,circular_overwrite_samples,circular_overwrite_events,circular_overwrite_detected," +
+                        "processing_dropped_samples,processing_overrun_events,processing_overrun_detected,processing_backlog_max_samples," +
+                        "snapshot_count,snapshot_late_events,snapshot_dropped_samples,snapshot_overrun_events,snapshot_late_detected," +
+                        "snapshot_max_duration_ms,snapshot_avg_duration_ms," +
+                        "decode_queue_max_depth,decode_queue_wait_p50_us,decode_queue_wait_p99_us,decode_queue_wait_max_us," +
+                        "q_reference,throughput_reference_samples_per_sec,q_not_increased,throughput_not_decreased," +
+                        "system_safe,proposal_criteria_passed,note"
+            )
+        }
+
+        w.appendLine(
+            listOf(
+                record.runId?.toString() ?: "",
+                record.isReference,
+                record.variant,
+                record.speed,
+                record.repetitions,
+                record.ringBufferCapacity,
+                record.snapshotIntervalMs,
+
+                record.startedAtEpochMs,
+                record.endedAtEpochMs,
+                record.durationMs,
+
+                record.packets,
+                record.totalSamples,
+                record.avgBytesOnWire,
+                record.lossRateQ,
+                record.throughputSamplesPerSec,
+                record.crcBad,
+                record.lenBad,
+
+                record.totalWrittenSamples,
+                record.circularOverwriteSamples,
+                record.circularOverwriteEvents,
+                record.circularOverwriteDetected,
+
+                record.processingDroppedSamples,
+                record.processingOverrunEvents,
+                record.processingOverrunDetected,
+                record.processingBacklogMaxSamples,
+
+                record.snapshotCount,
+                record.snapshotLateEvents,
+                record.snapshotDroppedSamples,
+                record.snapshotOverrunEvents,
+                record.snapshotLateDetected,
+                record.snapshotMaxDurationMs,
+                record.snapshotAvgDurationMs,
+
+                record.decodeQueueMaxDepth,
+                record.decodeQueueWaitP50Us,
+                record.decodeQueueWaitP99Us,
+                record.decodeQueueWaitMaxUs,
+
+                record.qReference?.toString() ?: "",
+                record.throughputReferenceSamplesPerSec?.toString() ?: "",
+                record.qNotIncreased,
+                record.throughputNotDecreased,
+
+                record.systemSafe,
+                record.proposalCriteriaPassed,
                 record.note.replace(",", ";")
             ).joinToString(",")
         )

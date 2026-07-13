@@ -207,15 +207,45 @@ class ShortRingBuffer(private val capacity: Int) {
             "appendDecodedInt16LeFromByteArrayFast out of bounds"
         }
 
-        if (head == 0 && size + sampleCount <= capacity) {
-            val tail = size
-            decodeIntoContiguous(src, offset, sampleCount, physicalStart = tail)
-            size += sampleCount
+        // Jalur BIN+ZC tidak boleh fallback ke jalur append biasa.
+        // Data payload langsung di-decode dari ByteArray MQTT ke backing ShortArray
+        // ring buffer, termasuk saat posisi ring sudah circular.
+        if (sampleCount >= capacity) {
+            val keep = capacity
+            val startSample = sampleCount - keep
+            val startOffset = offset + startSample * 2
+            val discarded = size + (sampleCount - keep)
+
+            recordCircularOverwrite(discarded)
+
+            oldestSeqValue = newestSeqExclusive() + sampleCount - keep
+            head = 0
+            size = keep
+
+            decodeIntoContiguous(src, startOffset, keep, physicalStart = 0)
             totalWrittenValue += sampleCount.toLong()
             return sampleCount
         }
 
-        return appendDecodedInt16LeFromByteArray(src, offset, sampleCount)
+        makeRoomFor(sampleCount)
+
+        val tail = (head + size) % capacity
+        val firstPart = min(sampleCount, capacity - tail)
+        decodeIntoContiguous(src, offset, firstPart, physicalStart = tail)
+
+        val remaining = sampleCount - firstPart
+        if (remaining > 0) {
+            decodeIntoContiguous(
+                src = src,
+                byteOffset = offset + firstPart * 2,
+                sampleCount = remaining,
+                physicalStart = 0
+            )
+        }
+
+        size += sampleCount
+        totalWrittenValue += sampleCount.toLong()
+        return sampleCount
     }
 
     private fun makeRoomFor(incomingCount: Int) {
